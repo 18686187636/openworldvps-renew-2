@@ -22,8 +22,10 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 
-# 网站根域
+# 账号标识（用于 Telegram 通知，可在 Secrets 中设置）
+ACCOUNT_NAME = os.environ.get("ACCOUNT_NAME", "未命名账号")
 
+# 网站根域
 SITE_BASE = "https://openworld.eu.org"
 
 # 续期天数阈值：剩余天数 <= 此值时才执行续期
@@ -35,13 +37,14 @@ SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
 
 def send_telegram_message(message: str):
-    """发送 Telegram 通知"""
+    """发送 Telegram 通知，自动在消息前添加账号标识"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("⚠️ Telegram 未配置，跳过通知")
         return
+    full_message = f"👤 账号: {ACCOUNT_NAME}\n{message}"
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
+        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": full_message}, timeout=10)
         print("✅ Telegram 通知已发送")
     except Exception as e:
         print(f"❌ Telegram 发送失败: {e}")
