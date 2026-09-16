@@ -32,6 +32,19 @@ SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
 PREFERRED_KINDS = ("puzzle", "key", "odd")
 MAX_SWITCH_PER_SESSION = 6
+
+# ⭐ 每帧轮换的对齐策略：(来源, 偏移px)
+# 来源 "img_w" = chip 图片实际宽度；"pw" = meta 给的标称宽度
+STRATEGIES = [
+    ("img_w",  0),
+    ("pw",     0),
+    ("img_w",  +4),
+    ("img_w",  -4),
+    ("img_w",  +8),
+    ("img_w",  -8),
+    ("pw",     +4),
+    ("pw",     -4),
+]
 # ==========================================
 
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -342,6 +355,7 @@ def _chip_shape(chip):
         "h": cy1 - cy0,
         "circ": circ,
         "nv": len(approx),
+        "alpha_bbox": (cx0, cy0, cx1, cy1),
     }
 
 
@@ -372,14 +386,13 @@ def _bg_black_shapes(bg_gray):
     return out
 
 
-def _solve_puzzle(bg_bytes, chip_bytes, meta):
+def _solve_puzzle(bg_bytes, chip_bytes, meta, strategy_idx=0):
     """
-    puzzle/key：bg 上 3 个黑色形状，chip 是其中一个形状的彩色版本，
-    要拖到同形状的黑块上，让 chip 图片"中心"与形状"中心"对齐。
+    puzzle/key：bg 上黑色形状是目标孔，chip 是彩色拼块。
+    要拖滑块让 chip 内容中心对齐目标形状中心。
 
-    ⭐ FIX: 拼图块在画布上的真实左边缘 = px + value，
-             所以滑块发送值应为 shape_cx - pw/2 - px。
-             原脚本漏掉 -px，导致 4px 系统性偏移，score 53/44/36 全 fail。
+    ⭐ v15 修复：不再只用 meta 的 pw，而是根据 chip 图片实际尺寸 +
+                策略轮换（img_w / pw / ±4 / ±8）来应对不同帧的偏差。
     """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
@@ -391,12 +404,16 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta):
     if chip.ndim != 3 or chip.shape[2] != 4:
         raise RuntimeError("chip 缺少 alpha")
 
+    img_h, img_w = chip.shape[:2]           # ⭐ 图片实际尺寸
+    print(f"   📐 chip bytes: {img_w}x{img_h}")
+
     chip_info = _chip_shape(chip)
     if chip_info is None:
         raise RuntimeError("chip 轮廓为空")
     chip_w, chip_h = chip_info["w"], chip_info["h"]
     chip_circ, chip_nv = chip_info["circ"], chip_info["nv"]
-    print(f"   📐 chip: {chip_w}x{chip_h} circ={chip_circ:.2f} nv={chip_nv}")
+    print(f"   📐 chip alpha bbox: {chip_w}x{chip_h} "
+          f"circ={chip_circ:.2f} nv={chip_nv}")
 
     candidates = _bg_black_shapes(bg_gray)
     if not candidates:
@@ -405,7 +422,8 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta):
     for c in candidates:
         print(f"      bbox={c['bbox']} circ={c['circ']:.2f} nv={c['nv']}")
 
-    best, best_score = None, -1.0
+    # ---- 形状打分 ----
+    scored = []
     for c in candidates:
         bw, bh = c["bbox"][2], c["bbox"][3]
         size_score = 1.0 - min(1.0, abs(bw - chip_w) + abs(bh - chip_h)) / 100.0
@@ -420,36 +438,41 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta):
             shape_score = 1.0 - abs(c["circ"] - chip_circ)
 
         score = 0.6 * shape_score + 0.4 * size_score
-        print(f"      → shape={shape_score:.2f} size={size_score:.2f} total={score:.2f}")
-        if score > best_score:
-            best_score, best = score, c
+        scored.append((score, c))
+        print(f"      bbox={c['bbox']} shape={shape_score:.2f} "
+              f"size={size_score:.2f} total={score:.2f}")
 
-    if best is None or best_score < 0.3:
-        raise RuntimeError(f"无匹配形状 (best_score={best_score:.2f})")
+    scored.sort(reverse=True, key=lambda x: x[0])
+    if not scored or scored[0][0] < 0.4:
+        raise RuntimeError(f"无匹配形状 (best={scored[0][0] if scored else 0:.2f})")
 
+    best_score, best = scored[0]
     x, y, w, h = best["bbox"]
-    # 让 chip 图片的"中心"对齐形状的"中心"
     shape_cx = x + w / 2.0
-    pw = int(meta.get("pw") or chip_w)
+
+    pw = int(meta.get("pw") or img_w)
     px = int(meta.get("px") or 0)
 
-    # ⭐ FIX: 减去 px 偏移（拼图块在画布内的基准位置）
-    value = int(round(shape_cx - pw / 2.0 - px))
+    # ⭐ 策略轮换
+    src, offset = STRATEGIES[strategy_idx % len(STRATEGIES)]
+    base_w = float(img_w) if src == "img_w" else float(pw)
 
+    value = int(round(shape_cx - base_w / 2.0 - px + offset))
     vmax = int(meta.get("vmax") or 300)
     value = max(0, min(vmax, value))
 
-    print(f"   🎯 选中 bbox=({x},{y},{w},{h}) score={best_score:.2f} "
-          f"shape_cx={shape_cx:.1f} pw={pw} px={px} → value={value}")
+    print(f"   🎯 bbox=({x},{y},{w},{h}) score={best_score:.2f} "
+          f"shape_cx={shape_cx:.1f} img_w={img_w} pw={pw} px={px} "
+          f"strategy=#{strategy_idx % len(STRATEGIES)}({src},{offset:+d}) → value={value}")
 
     # 调试可视化
     try:
         vis = bg_rgb.copy()
         cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
-        # 拼图块最终位置 = px + value
-        cv2.rectangle(vis, (px + value, y), (px + value + pw, y + h), (0, 255, 0), 2)
+        cv2.rectangle(vis, (px + value, y), (px + value + int(base_w), y + h),
+                      (0, 255, 0), 2)
         cv2.imwrite(os.path.join(SCREENSHOT_DIR,
-                                 f"puzzle_align_{meta['id'][:6]}.png"), vis)
+                                 f"puzzle_align_{meta['id'][:6]}_s{strategy_idx}.png"), vis)
     except Exception as e:
         print(f"   ⚠️ 可视化: {e}")
 
@@ -671,7 +694,7 @@ def _drag_slider(page, value, vmax):
 
 # ================= 一关处理 =================
 
-def _handle_one_stage(page, meta, frames, tag=""):
+def _handle_one_stage(page, meta, frames, tag="", strategy_idx=0):
     """
     True       -> 已提交
     "switched" -> 已切换类型
@@ -682,18 +705,17 @@ def _handle_one_stage(page, meta, frames, tag=""):
     print(f"   🎯 kind={kind} nf={meta.get('nf')} "
           f"stage={meta.get('stage')}/{meta.get('stages')} alt={alt}")
 
-    # ⭐ FIX: 优先切掉不擅长的类型（包含 match）
+    # 优先切掉不擅长的类型（含 match）
     if kind not in PREFERRED_KINDS:
         if alt in PREFERRED_KINDS:
             try:
                 btn = page.locator("#captcha_switch_default").first
                 if btn.is_visible(timeout=1500):
                     btn.click()
-                    print(f"   🔁 切换到更擅长的类型: {kind} → {alt}")
+                    print(f"   🔁 切换类型: {kind} → {alt}")
                     return "switched"
             except Exception as e:
                 print(f"   ⚠️ 切换失败: {e}")
-        # match 等无 alt 可切时，直接放弃本次会话
         if kind == "match":
             print("   ⚠️ match 类型无法处理且无可用 alt，放弃会话")
             return False
@@ -703,7 +725,8 @@ def _handle_one_stage(page, meta, frames, tag=""):
             print("   ⚠️ nf<2")
             return False
         try:
-            value = _solve_puzzle(frames[0], frames[1], meta)
+            value = _solve_puzzle(frames[0], frames[1], meta,
+                                  strategy_idx=strategy_idx)
             print(f"   🧩 value={value} vmax={meta.get('vmax')}")
             _drag_slider(page, value, int(meta.get("vmax") or 300))
             return True
@@ -776,6 +799,9 @@ def _try_renew_session(page, attempt, initial_days):
     start = time.time()
     max_total = 260
 
+    # ⭐ 用于策略轮换：本会话内已提交的 stage 数
+    total_attempts = 0
+
     while time.time() - start < max_total:
         resp = WS_STATE["last_resp"]
 
@@ -823,13 +849,13 @@ def _try_renew_session(page, attempt, initial_days):
             print(f"   ❌ bot: {resp}")
             return None
 
-        # ⭐ FIX: 处理 fail / failed: 响应（原脚本未处理，导致去重后空转 45s 退出）
+        # ---- 答案错误，等新帧 ----
         if resp and (resp == "fail" or resp.startswith("failed:")):
-            print("   ⚠️ 服务端拒绝了本次答案，重置状态等待新验证码")
-            handled_fps.clear()                # 关键：清掉重复指纹
-            WS_STATE["meta"]      = None
+            print("   ⚠️ 答案被拒，等待新验证码帧（换策略）")
+            handled_fps.clear()
+            WS_STATE["meta"] = None
             WS_STATE["last_resp"] = None
-            WS_STATE["frames"]    = []
+            WS_STATE["frames"] = []
             page.wait_for_timeout(350)
             continue
 
@@ -842,7 +868,6 @@ def _try_renew_session(page, attempt, initial_days):
               meta.get("ox"), meta.get("oy"))
         if fp in handled_fps:
             page.wait_for_timeout(300)
-            # ⭐ FIX: 45s → 60s，避免偶发延迟误杀
             if time.time() - last_action > 60:
                 print("   ⚠️ 60s 无新状态，退出")
                 return None
@@ -867,7 +892,12 @@ def _try_renew_session(page, attempt, initial_days):
             except Exception:
                 pass
 
-        result = _handle_one_stage(page, meta, frames, tag=tag)
+        # ⭐ 轮换策略
+        strategy_idx = total_attempts % len(STRATEGIES)
+        total_attempts += 1
+
+        result = _handle_one_stage(page, meta, frames,
+                                   tag=tag, strategy_idx=strategy_idx)
 
         if result == "switched":
             switch_count += 1
@@ -959,7 +989,7 @@ def get_vps_urls(page):
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期 (v14 - px 偏移修正 + fail 恢复)")
+    print("   Openworld VPS 自动续期 (v15 - 策略轮换 + 图片尺寸对齐)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
