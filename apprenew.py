@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# v18: 修复对齐策略顺序 / 切换消耗索引 / fail 竞态 / rotate 质量门
 
 import os
 import re
@@ -30,10 +31,32 @@ SITE_BASE     = "https://openworld.eu.org"
 RENEW_THRESHOLD_DAYS = 5
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
-# ⭐ v17: 加入 rotate
 PREFERRED_KINDS = ("puzzle", "key", "rotate", "odd")
 MAX_SWITCH_PER_SESSION = 8
-MAX_FAIL_PER_SESSION = 5     # ⭐ v17: 单会话 fail 超过此数主动放弃
+MAX_FAIL_PER_SESSION = 5
+
+# ⭐ v18: 把 "sub" 放到最前（物理上更正确）
+#   px_mode: "none" = shape_cx - alpha_cx
+#            "sub"  = shape_cx - alpha_cx - px
+#            "add"  = shape_cx - alpha_cx + px
+ALIGN_STRATEGIES = [
+    ("sub",  0),
+    ("sub", +1),
+    ("sub", -1),
+    ("none", 0),
+    ("none", +1),
+    ("none", -1),
+    ("sub", +2),
+    ("sub", -2),
+    ("add",  0),
+    ("none", +2),
+    ("none", -2),
+]
+
+# ⭐ v18: rotate NCC 阈值，低于此值直接放弃
+ROTATE_NCC_MIN = 0.35
+
+ALIGN_STATE = {"counter": 0}
 # ==========================================
 
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -71,30 +94,13 @@ WS_STATE = {
     "last_resp": None,
     "sent": [],
     "closed": False,
+    "fail_pending": False,   # ⭐ v18
 }
-
-# ⭐ v17: 对齐策略轮换（不再用形状候选，直接换对齐偏移）
-# (名字, px_mode, offset)
-#   px_mode: "none" = shape_cx - alpha_cx
-#            "sub"  = shape_cx - alpha_cx - px
-#            "add"  = shape_cx - alpha_cx + px
-ALIGN_STRATEGIES = [
-    ("none", 0),
-    ("none", +1),
-    ("none", -1),
-    ("none", +2),
-    ("none", -2),
-    ("sub",  0),
-    ("add",  0),
-    ("none", +3),
-    ("none", -3),
-]
-ALIGN_STATE = {"counter": 0}
 
 
 def _reset_ws_state():
     WS_STATE.update({"meta": None, "frames": [], "last_resp": None,
-                     "sent": [], "closed": False})
+                     "sent": [], "closed": False, "fail_pending": False})
 
 
 def _reset_align_pick():
@@ -127,6 +133,9 @@ def _install_ws_hook(page):
                     s = str(payload)
                     WS_STATE["last_resp"] = s
                     print(f"   ⬅️ {s[:180]}")
+                    # ⭐ v18: 在这里就标记失败，避免后续被新 challenge 覆盖
+                    if s == "fail" or s.startswith("failed:"):
+                        WS_STATE["fail_pending"] = True
                     try:
                         m = json.loads(s)
                         if isinstance(m, dict) and m.get("id") and m.get("nf"):
@@ -405,10 +414,7 @@ def _bg_black_shapes(bg_gray):
 def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
     """
     puzzle/key：chip 拖到形状中心。
-
-    ⭐ v17 关键修复：对齐公式改为 shape_cx - alpha_cx（不减 px）。
-        alpha_cx 已含 px（因为 alpha 内容位于图片内 (px, py) 处）。
-        px 只是一个视觉 padding，不影响滑块值。
+    对齐公式：value = shape_cx - alpha_cx - px * mode + offset
     """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
@@ -440,7 +446,7 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
         bw, bh = c["bbox"][2], c["bbox"][3]
         size_score = 1.0 - min(1.0, abs(bw - chip_w) + abs(bh - chip_h)) / 100.0
 
-        if chip_nv in (3, 4, 5, 6, 8, 7):
+        if chip_nv in (3, 4, 5, 6, 7, 8):
             shape_score = 1.0 if c["nv"] == chip_nv else 0.2
         elif chip_circ > 0.75:
             shape_score = 1.0 if c["circ"] > 0.75 else 0.2
@@ -464,7 +470,6 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
     pw = int(meta.get("pw") or img_w)
     vmax = int(meta.get("vmax") or 300)
 
-    # ⭐ v17: 策略轮换
     mode, offset = ALIGN_STRATEGIES[align_idx % len(ALIGN_STRATEGIES)]
     base = shape_cx - alpha_cx
     if mode == "sub":
@@ -490,11 +495,14 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
 
 
 def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
-    """rotate：chip 固定在 (ox,oy,ow,oh) 绕中心旋转，需要转到正确朝向。"""
+    """
+    rotate：chip 固定在 (ox,oy,ow,oh) 绕中心旋转。
+    返回: 角度（>=0），或 -1 表示放弃（NCC 太低）。
+    """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
-        return 0
+        return -1
     bg_rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
     bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY)
     H, W = bg_gray.shape
@@ -605,6 +613,11 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     except Exception as e:
         print(f"   ⚠️ 可视化: {e}")
 
+    # ⭐ v18: NCC 质量门
+    if best_score < ROTATE_NCC_MIN:
+        print(f"   ⚠️ NCC 低于阈值 {ROTATE_NCC_MIN}，放弃本次提交")
+        return -1
+
     return (360 - best_angle) % 360
 
 
@@ -664,7 +677,6 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
     print(f"   🎯 kind={kind} nf={meta.get('nf')} "
           f"stage={meta.get('stage')}/{meta.get('stages')} alt={alt}")
 
-    # 优先切到擅长的类型
     if kind not in PREFERRED_KINDS:
         if alt in PREFERRED_KINDS:
             try:
@@ -675,7 +687,6 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
                     return "switched"
             except Exception as e:
                 print(f"   ⚠️ 切换失败: {e}")
-        # 不在 PREFERRED_KINDS 且 alt 也无解 → 放弃会话
         print(f"   ⚠️ {kind} 无法处理，放弃会话")
         return False
 
@@ -698,6 +709,9 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
             return False
         try:
             value = _solve_rotate(frames[0], frames[1], meta, tag=tag)
+            if value < 0:
+                print("   ⚠️ rotate 求解失败，放弃本次提交")
+                return False
             print(f"   🎯 value={value} vmax={meta.get('vmax')}")
             _drag_slider(page, value, int(meta.get("vmax") or 359))
             return True
@@ -705,7 +719,6 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
             print(f"   ❌ rotate: {e}")
             return False
 
-    # ⭐ v17: odd 类型暂时放弃，交给切换/换会话
     if kind == "odd":
         print("   ⚠️ odd 类型暂不处理，放弃会话")
         return False
@@ -747,6 +760,21 @@ def _try_renew_session(page, attempt, initial_days):
     max_total = 300
 
     while time.time() - start < max_total:
+        # ⭐ v18: 先处理 fail_pending，避免被新 challenge 覆盖后漏检
+        if WS_STATE.get("fail_pending"):
+            WS_STATE["fail_pending"] = False
+            fail_count += 1
+            print(f"   ⚠️ 答案被拒 (fail #{fail_count}/{MAX_FAIL_PER_SESSION})")
+            if fail_count >= MAX_FAIL_PER_SESSION:
+                print(f"   ⚠️ fail 次数达上限，退出会话")
+                return None
+            handled_fps.clear()
+            # ⭐ v18: 不再清空 meta——服务器可能已发来新 challenge
+            # 只清 frames，让新 challenge 的 frames 重新收集
+            WS_STATE["frames"] = []
+            page.wait_for_timeout(350)
+            continue
+
         resp = WS_STATE["last_resp"]
 
         # ---- 成功 ----
@@ -793,20 +821,6 @@ def _try_renew_session(page, attempt, initial_days):
             print(f"   ❌ bot: {resp}")
             return None
 
-        # ---- 答案错误 ----
-        if resp and (resp == "fail" or resp.startswith("failed:")):
-            fail_count += 1
-            print(f"   ⚠️ 答案被拒 (fail #{fail_count}/{MAX_FAIL_PER_SESSION})")
-            if fail_count >= MAX_FAIL_PER_SESSION:
-                print(f"   ⚠️ fail 次数达上限，退出会话")
-                return None
-            handled_fps.clear()
-            WS_STATE["meta"] = None
-            WS_STATE["last_resp"] = None
-            WS_STATE["frames"] = []
-            page.wait_for_timeout(350)
-            continue
-
         meta = WS_STATE["meta"]
         if not meta or not meta.get("id"):
             page.wait_for_timeout(300)
@@ -840,13 +854,12 @@ def _try_renew_session(page, attempt, initial_days):
             except Exception:
                 pass
 
-        # ⭐ v17: 策略轮换
         align_idx = ALIGN_STATE["counter"]
-        ALIGN_STATE["counter"] += 1
 
         result = _handle_one_stage(page, meta, frames,
                                    tag=tag, align_idx=align_idx)
 
+        # ⭐ v18: 切换不消耗策略索引
         if result == "switched":
             switch_count += 1
             if switch_count > MAX_SWITCH_PER_SESSION:
@@ -858,6 +871,8 @@ def _try_renew_session(page, attempt, initial_days):
         if not result:
             return None
 
+        # ⭐ v18: 只有真正提交答案后才递增策略索引
+        ALIGN_STATE["counter"] += 1
         page.wait_for_timeout(600)
 
     print(f"   ❌ 超时 {max_total}s")
@@ -938,7 +953,7 @@ def get_vps_urls(page):
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期 (v17 - alpha_cx 对齐 + 策略轮换)")
+    print("   Openworld VPS 自动续期 (v18 - sub 优先 + fail_pending + rotate 阈值)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
