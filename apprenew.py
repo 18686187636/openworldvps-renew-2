@@ -30,8 +30,10 @@ SITE_BASE     = "https://openworld.eu.org"
 RENEW_THRESHOLD_DAYS = 5
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
-PREFERRED_KINDS = ("puzzle", "key", "odd")
-MAX_SWITCH_PER_SESSION = 6
+# ⭐ v17: 加入 rotate
+PREFERRED_KINDS = ("puzzle", "key", "rotate", "odd")
+MAX_SWITCH_PER_SESSION = 8
+MAX_FAIL_PER_SESSION = 5     # ⭐ v17: 单会话 fail 超过此数主动放弃
 # ==========================================
 
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -71,8 +73,23 @@ WS_STATE = {
     "closed": False,
 }
 
-# ⭐ 全局形状候选轮换计数器（每次尝试递增，跨帧交替选择候选）
-SHAPE_PICK_STATE = {"counter": 0}
+# ⭐ v17: 对齐策略轮换（不再用形状候选，直接换对齐偏移）
+# (名字, px_mode, offset)
+#   px_mode: "none" = shape_cx - alpha_cx
+#            "sub"  = shape_cx - alpha_cx - px
+#            "add"  = shape_cx - alpha_cx + px
+ALIGN_STRATEGIES = [
+    ("none", 0),
+    ("none", +1),
+    ("none", -1),
+    ("none", +2),
+    ("none", -2),
+    ("sub",  0),
+    ("add",  0),
+    ("none", +3),
+    ("none", -3),
+]
+ALIGN_STATE = {"counter": 0}
 
 
 def _reset_ws_state():
@@ -80,8 +97,8 @@ def _reset_ws_state():
                      "sent": [], "closed": False})
 
 
-def _reset_shape_pick():
-    SHAPE_PICK_STATE["counter"] = 0
+def _reset_align_pick():
+    ALIGN_STATE["counter"] = 0
 
 
 def _install_ws_hook(page):
@@ -327,7 +344,7 @@ def _decode(b):
 
 
 def _chip_shape(chip):
-    """从 chip 的 alpha 提取形状描述，同时返回 alpha 内容在图片内的几何信息。"""
+    """从 chip 的 alpha 提取形状描述 + alpha 内容几何。"""
     alpha = chip[:, :, 3]
     ys, xs = np.where(alpha > 200)
     if len(xs) == 0:
@@ -349,7 +366,6 @@ def _chip_shape(chip):
         "h": cy1 - cy0,
         "circ": circ,
         "nv": len(approx),
-        # ⭐ alpha 内容在 chip 图片坐标系内的位置（供对齐使用）
         "alpha_x0": cx0,
         "alpha_y0": cy0,
         "alpha_x1": cx1,
@@ -386,17 +402,13 @@ def _bg_black_shapes(bg_gray):
     return out
 
 
-def _solve_puzzle(bg_bytes, chip_bytes, meta):
+def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
     """
-    puzzle/key：
-      - bg 上有多个黑色形状（孔），只有一个与 chip 轮廓匹配
-      - chip 是彩色拼块，需要拖到匹配的孔上
-      - 对齐基准是 chip alpha 内容中心与孔中心重合
+    puzzle/key：chip 拖到形状中心。
 
-    ⭐ v16 关键修复：
-      1. 跨帧轮换形状候选（SHAPE_PICK_STATE 全局计数器）
-      2. 严格按 nv（多边形顶点数）优先匹配形状
-      3. 对齐基准改为 chip alpha 内容中心，而不是整张 72x72 图片
+    ⭐ v17 关键修复：对齐公式改为 shape_cx - alpha_cx（不减 px）。
+        alpha_cx 已含 px（因为 alpha 内容位于图片内 (px, py) 处）。
+        px 只是一个视觉 padding，不影响滑块值。
     """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
@@ -414,25 +426,24 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta):
         raise RuntimeError("chip 轮廓为空")
     chip_w, chip_h = chip_info["w"], chip_info["h"]
     chip_circ, chip_nv = chip_info["circ"], chip_info["nv"]
+    alpha_cx = chip_info["alpha_cx"]
     print(f"   📐 chip img: {img_w}x{img_h}  alpha bbox: {chip_w}x{chip_h} "
-          f"circ={chip_circ:.2f} nv={chip_nv}")
+          f"circ={chip_circ:.2f} nv={chip_nv} alpha_cx={alpha_cx:.1f}")
 
     candidates = _bg_black_shapes(bg_gray)
     if not candidates:
         raise RuntimeError("bg 上未找到黑色形状")
     print(f"   🔍 bg 上检测到 {len(candidates)} 个形状:")
 
-    # ---- 形状打分 ----
     scored = []
     for c in candidates:
         bw, bh = c["bbox"][2], c["bbox"][3]
         size_score = 1.0 - min(1.0, abs(bw - chip_w) + abs(bh - chip_h)) / 100.0
 
-        # ⭐ 关键：优先按 nv 匹配；只有 nv 不明确时才退回到圆度
-        if chip_nv in (3, 4, 5, 6, 8):
-            shape_score = 1.0 if c["nv"] == chip_nv else 0.1
+        if chip_nv in (3, 4, 5, 6, 8, 7):
+            shape_score = 1.0 if c["nv"] == chip_nv else 0.2
         elif chip_circ > 0.75:
-            shape_score = 1.0 if c["circ"] > 0.75 else 0.1
+            shape_score = 1.0 if c["circ"] > 0.75 else 0.2
         else:
             shape_score = max(0.0, 1.0 - abs(c["circ"] - chip_circ))
 
@@ -442,45 +453,36 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta):
               f"shape={shape_score:.2f} size={size_score:.2f} total={score:.2f}")
 
     scored.sort(reverse=True, key=lambda x: x[0])
-
-    # ⭐ 跨帧轮换形状候选
-    pick_idx = SHAPE_PICK_STATE["counter"] % len(scored)
-    SHAPE_PICK_STATE["counter"] += 1
-    best_score, best = scored[pick_idx]
-    print(f"   🔀 形状候选 #{pick_idx}/{len(scored)} "
-          f"(score={best_score:.2f}, nv={best['nv']})")
+    best_score, best = scored[0]
+    if best_score < 0.5:
+        raise RuntimeError(f"形状匹配度过低 ({best_score:.2f})")
 
     x, y, w, h = best["bbox"]
     shape_cx = x + w / 2.0
 
-    # ⭐ 对齐基准：chip alpha 内容中心与孔中心重合
-    #   拼图块 alpha 内容在图片内的左边缘偏移 = chip_info["alpha_x0"]
-    #   拼图块显示时图片左边缘在画布 x = px + value
-    #   所以 alpha 内容中心在画布 x = px + value + chip_info["alpha_cx"]
-    #   令其 = shape_cx:
-    #       value = shape_cx - chip_info["alpha_cx"] - px
     px = int(meta.get("px") or 0)
     pw = int(meta.get("pw") or img_w)
     vmax = int(meta.get("vmax") or 300)
 
-    alpha_cx = chip_info["alpha_cx"]
-    value = int(round(shape_cx - alpha_cx - px))
+    # ⭐ v17: 策略轮换
+    mode, offset = ALIGN_STRATEGIES[align_idx % len(ALIGN_STRATEGIES)]
+    base = shape_cx - alpha_cx
+    if mode == "sub":
+        base -= px
+    elif mode == "add":
+        base += px
+    value = int(round(base + offset))
     value = max(0, min(vmax, value))
 
-    print(f"   🎯 bbox=({x},{y},{w},{h}) shape_cx={shape_cx:.1f} "
-          f"alpha_cx={alpha_cx:.1f} px={px} pw={pw} vmax={vmax} → value={value}")
+    print(f"   🎯 bbox=({x},{y},{w},{h}) score={best_score:.2f} "
+          f"shape_cx={shape_cx:.1f} alpha_cx={alpha_cx:.1f} px={px} pw={pw} "
+          f"strategy=#{align_idx % len(ALIGN_STRATEGIES)}({mode},{offset:+d}) → value={value}")
 
-    # 调试可视化
     try:
         vis = bg_rgb.copy()
         cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
-        # 拼图块 alpha 内容在画布上的左右边界
-        img_left  = px + value
-        cont_left = img_left + chip_info["alpha_x0"]
-        cont_right = img_left + chip_info["alpha_x1"]
-        cv2.rectangle(vis, (cont_left, y), (cont_right, y + h), (0, 255, 0), 2)
         cv2.imwrite(os.path.join(SCREENSHOT_DIR,
-                                 f"puzzle_align_{meta['id'][:6]}_p{pick_idx}.png"), vis)
+                                 f"puzzle_align_{meta['id'][:6]}_a{align_idx}.png"), vis)
     except Exception as e:
         print(f"   ⚠️ 可视化: {e}")
 
@@ -606,58 +608,7 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     return (360 - best_angle) % 360
 
 
-def _solve_odd(bg_bytes, meta):
-    bg = _decode(bg_bytes)
-    if bg is None:
-        return None
-    bg_rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
-    items = meta.get("items") or []
-    if len(items) < 3:
-        return None
-
-    feats = []
-    for it in items:
-        x, y, r = int(it["x"]), int(it["y"]), int(it["r"])
-        x1, y1 = max(0, x - r), max(0, y - r)
-        x2, y2 = min(bg_rgb.shape[1], x + r), min(bg_rgb.shape[0], y + r)
-        patch = bg_rgb[y1:y2, x1:x2]
-        if patch.size == 0:
-            feats.append(None)
-            continue
-        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-        h = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
-        h = cv2.normalize(h, h).flatten().astype(np.float32)
-        feats.append(h)
-
-    best_i, best_score = -1, -1.0
-    for i, fi in enumerate(feats):
-        if fi is None:
-            continue
-        tot, cnt = 0.0, 0
-        for j, fj in enumerate(feats):
-            if i == j or fj is None:
-                continue
-            tot += float(cv2.compareHist(fi, fj, cv2.HISTCMP_BHATTACHARYYA))
-            cnt += 1
-        if cnt and tot / cnt > best_score:
-            best_score, best_i = tot / cnt, i
-    return best_i if best_i >= 0 else None
-
-
 # ================= 交互 =================
-
-def _click_box_at(page, meta, ix, iy):
-    box = page.locator("#captcha_box_default").bounding_box()
-    if not box:
-        raise RuntimeError("captcha box 不可见")
-    sx = box["width"] / float(meta.get("w", 300))
-    sy = box["height"] / float(meta.get("h", 160))
-    px = box["x"] + ix * sx
-    py = box["y"] + iy * sy
-    page.mouse.move(px, py)
-    page.wait_for_timeout(random.randint(80, 160))
-    page.mouse.click(px, py)
-
 
 def _drag_slider(page, value, vmax):
     track = page.locator("#captcha_track_default")
@@ -702,7 +653,7 @@ def _drag_slider(page, value, vmax):
 
 # ================= 一关处理 =================
 
-def _handle_one_stage(page, meta, frames, tag=""):
+def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
     """
     True       -> 已提交
     "switched" -> 已切换类型
@@ -724,16 +675,16 @@ def _handle_one_stage(page, meta, frames, tag=""):
                     return "switched"
             except Exception as e:
                 print(f"   ⚠️ 切换失败: {e}")
-        if kind == "match":
-            print("   ⚠️ match 无法处理且无可用 alt，放弃会话")
-            return False
+        # 不在 PREFERRED_KINDS 且 alt 也无解 → 放弃会话
+        print(f"   ⚠️ {kind} 无法处理，放弃会话")
+        return False
 
     if kind in ("puzzle", "key"):
         if len(frames) < 2:
             print("   ⚠️ nf<2")
             return False
         try:
-            value = _solve_puzzle(frames[0], frames[1], meta)
+            value = _solve_puzzle(frames[0], frames[1], meta, align_idx=align_idx)
             print(f"   🧩 value={value} vmax={meta.get('vmax')}")
             _drag_slider(page, value, int(meta.get("vmax") or 300))
             return True
@@ -754,22 +705,10 @@ def _handle_one_stage(page, meta, frames, tag=""):
             print(f"   ❌ rotate: {e}")
             return False
 
+    # ⭐ v17: odd 类型暂时放弃，交给切换/换会话
     if kind == "odd":
-        if not frames:
-            return False
-        idx = _solve_odd(frames[0], meta)
-        if idx is None:
-            print("   ⚠️ odd 求解失败")
-            return False
-        items = meta.get("items") or []
-        it = items[idx]
-        print(f"   🎯 点击 item[{idx}] @({it['x']},{it['y']})")
-        try:
-            _click_box_at(page, meta, it["x"], it["y"])
-            return True
-        except Exception as e:
-            print(f"   ❌ odd: {e}")
-            return False
+        print("   ⚠️ odd 类型暂不处理，放弃会话")
+        return False
 
     print(f"   ⚠️ 未支持 kind: {kind}")
     return False
@@ -802,6 +741,7 @@ def _try_renew_session(page, attempt, initial_days):
 
     handled_fps = set()
     switch_count = 0
+    fail_count = 0
     last_action = time.time()
     start = time.time()
     max_total = 300
@@ -855,7 +795,11 @@ def _try_renew_session(page, attempt, initial_days):
 
         # ---- 答案错误 ----
         if resp and (resp == "fail" or resp.startswith("failed:")):
-            print("   ⚠️ 答案被拒，等新帧（换形状候选）")
+            fail_count += 1
+            print(f"   ⚠️ 答案被拒 (fail #{fail_count}/{MAX_FAIL_PER_SESSION})")
+            if fail_count >= MAX_FAIL_PER_SESSION:
+                print(f"   ⚠️ fail 次数达上限，退出会话")
+                return None
             handled_fps.clear()
             WS_STATE["meta"] = None
             WS_STATE["last_resp"] = None
@@ -896,7 +840,12 @@ def _try_renew_session(page, attempt, initial_days):
             except Exception:
                 pass
 
-        result = _handle_one_stage(page, meta, frames, tag=tag)
+        # ⭐ v17: 策略轮换
+        align_idx = ALIGN_STATE["counter"]
+        ALIGN_STATE["counter"] += 1
+
+        result = _handle_one_stage(page, meta, frames,
+                                   tag=tag, align_idx=align_idx)
 
         if result == "switched":
             switch_count += 1
@@ -918,9 +867,7 @@ def _try_renew_session(page, attempt, initial_days):
 
 def try_renew_captcha(page, initial_days, max_attempts=4):
     for attempt in range(1, max_attempts + 1):
-        # ⭐ 每次新会话重置形状候选轮换（保证从候选 0 开始）
-        _reset_shape_pick()
-
+        _reset_align_pick()
         try:
             r = _try_renew_session(page, attempt, initial_days)
         except Exception as e:
@@ -991,7 +938,7 @@ def get_vps_urls(page):
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期 (v16 - 形状候选轮换 + alpha 中心对齐)")
+    print("   Openworld VPS 自动续期 (v17 - alpha_cx 对齐 + 策略轮换)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
