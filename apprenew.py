@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v18: 修复对齐策略顺序 / 切换消耗索引 / fail 竞态 / rotate 质量门
+# v19: none 优先 / odd 走切换 / WS 关闭感知
 
 import os
 import re
@@ -31,29 +31,25 @@ SITE_BASE     = "https://openworld.eu.org"
 RENEW_THRESHOLD_DAYS = 5
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
-PREFERRED_KINDS = ("puzzle", "key", "rotate", "odd")
+# ⭐ v19: 只有这三种能被真正求解
+SUPPORTED_KINDS = ("puzzle", "key", "rotate")
+
 MAX_SWITCH_PER_SESSION = 8
 MAX_FAIL_PER_SESSION = 5
 
-# ⭐ v18: 把 "sub" 放到最前（物理上更正确）
-#   px_mode: "none" = shape_cx - alpha_cx
-#            "sub"  = shape_cx - alpha_cx - px
-#            "add"  = shape_cx - alpha_cx + px
+# ⭐ v19: none 优先（两次日志 score≈52/53 说明正确答案是 none 公式）
 ALIGN_STRATEGIES = [
-    ("sub",  0),
-    ("sub", +1),
-    ("sub", -1),
-    ("none", 0),
+    ("none",  0),   # shape_cx - alpha_cx
+    ("none", -1),   # shape_cx - alpha_cx - 1
     ("none", +1),
-    ("none", -1),
-    ("sub", +2),
-    ("sub", -2),
-    ("add",  0),
-    ("none", +2),
+    ("sub",   0),   # shape_cx - alpha_cx - px
+    ("sub",  -1),
+    ("sub",  +1),
     ("none", -2),
+    ("none", +2),
+    ("add",   0),   # shape_cx - alpha_cx + px
 ]
 
-# ⭐ v18: rotate NCC 阈值，低于此值直接放弃
 ROTATE_NCC_MIN = 0.35
 
 ALIGN_STATE = {"counter": 0}
@@ -94,7 +90,7 @@ WS_STATE = {
     "last_resp": None,
     "sent": [],
     "closed": False,
-    "fail_pending": False,   # ⭐ v18
+    "fail_pending": False,
 }
 
 
@@ -112,6 +108,8 @@ def _install_ws_hook(page):
         if "openworld.eu.org" not in ws.url:
             return
         WS_STATE["url"] = ws.url
+        # ⭐ v19: 新 WS 建立时先清 closed，避免上一轮的 closed=True 残留
+        WS_STATE["closed"] = False
         print(f"   🔌 WebSocket: {ws.url}")
 
         def on_sent(payload):
@@ -133,7 +131,6 @@ def _install_ws_hook(page):
                     s = str(payload)
                     WS_STATE["last_resp"] = s
                     print(f"   ⬅️ {s[:180]}")
-                    # ⭐ v18: 在这里就标记失败，避免后续被新 challenge 覆盖
                     if s == "fail" or s.startswith("failed:"):
                         WS_STATE["fail_pending"] = True
                     try:
@@ -353,7 +350,6 @@ def _decode(b):
 
 
 def _chip_shape(chip):
-    """从 chip 的 alpha 提取形状描述 + alpha 内容几何。"""
     alpha = chip[:, :, 3]
     ys, xs = np.where(alpha > 200)
     if len(xs) == 0:
@@ -385,7 +381,6 @@ def _chip_shape(chip):
 
 
 def _bg_black_shapes(bg_gray):
-    """找 bg 上所有黑色连通域。"""
     _, th = cv2.threshold(bg_gray, 40, 255, cv2.THRESH_BINARY_INV)
     kernel = np.ones((3, 3), np.uint8)
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -412,10 +407,6 @@ def _bg_black_shapes(bg_gray):
 
 
 def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
-    """
-    puzzle/key：chip 拖到形状中心。
-    对齐公式：value = shape_cx - alpha_cx - px * mode + offset
-    """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
@@ -495,10 +486,6 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
 
 
 def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
-    """
-    rotate：chip 固定在 (ox,oy,ow,oh) 绕中心旋转。
-    返回: 角度（>=0），或 -1 表示放弃（NCC 太低）。
-    """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
@@ -613,7 +600,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     except Exception as e:
         print(f"   ⚠️ 可视化: {e}")
 
-    # ⭐ v18: NCC 质量门
     if best_score < ROTATE_NCC_MIN:
         print(f"   ⚠️ NCC 低于阈值 {ROTATE_NCC_MIN}，放弃本次提交")
         return -1
@@ -677,8 +663,9 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
     print(f"   🎯 kind={kind} nf={meta.get('nf')} "
           f"stage={meta.get('stage')}/{meta.get('stages')} alt={alt}")
 
-    if kind not in PREFERRED_KINDS:
-        if alt in PREFERRED_KINDS:
+    # ⭐ v19: 不在支持列表（含 odd/match）→ 尝试切到 alt
+    if kind not in SUPPORTED_KINDS:
+        if alt in SUPPORTED_KINDS:
             try:
                 btn = page.locator("#captcha_switch_default").first
                 if btn.is_visible(timeout=1500):
@@ -687,7 +674,7 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
                     return "switched"
             except Exception as e:
                 print(f"   ⚠️ 切换失败: {e}")
-        print(f"   ⚠️ {kind} 无法处理，放弃会话")
+        print(f"   ⚠️ {kind} 无法处理（alt={alt}），放弃会话")
         return False
 
     if kind in ("puzzle", "key"):
@@ -718,10 +705,6 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
         except Exception as e:
             print(f"   ❌ rotate: {e}")
             return False
-
-    if kind == "odd":
-        print("   ⚠️ odd 类型暂不处理，放弃会话")
-        return False
 
     print(f"   ⚠️ 未支持 kind: {kind}")
     return False
@@ -760,7 +743,11 @@ def _try_renew_session(page, attempt, initial_days):
     max_total = 300
 
     while time.time() - start < max_total:
-        # ⭐ v18: 先处理 fail_pending，避免被新 challenge 覆盖后漏检
+        # ⭐ v19: WS 关闭 → 直接退出会话，让上层开新会话
+        if WS_STATE.get("closed"):
+            print("   ⚠️ WS 已关闭，退出会话")
+            return None
+
         if WS_STATE.get("fail_pending"):
             WS_STATE["fail_pending"] = False
             fail_count += 1
@@ -769,15 +756,15 @@ def _try_renew_session(page, attempt, initial_days):
                 print(f"   ⚠️ fail 次数达上限，退出会话")
                 return None
             handled_fps.clear()
-            # ⭐ v18: 不再清空 meta——服务器可能已发来新 challenge
-            # 只清 frames，让新 challenge 的 frames 重新收集
             WS_STATE["frames"] = []
+            if WS_STATE.get("closed"):
+                print("   ⚠️ fail 后 WS 已关闭，退出会话")
+                return None
             page.wait_for_timeout(350)
             continue
 
         resp = WS_STATE["last_resp"]
 
-        # ---- 成功 ----
         if resp and resp.startswith("ok:"):
             token = resp[3:]
             print(f"   🎉 全部通过！token 长度={len(token)}")
@@ -813,7 +800,6 @@ def _try_renew_session(page, attempt, initial_days):
             print("   ⚠️ 无法解析天数")
             return None
 
-        # ---- 服务端拒绝 ----
         if resp in ("burned", "blocked", "rate"):
             print(f"   ❌ 服务端拒绝: {resp}")
             return None
@@ -859,7 +845,6 @@ def _try_renew_session(page, attempt, initial_days):
         result = _handle_one_stage(page, meta, frames,
                                    tag=tag, align_idx=align_idx)
 
-        # ⭐ v18: 切换不消耗策略索引
         if result == "switched":
             switch_count += 1
             if switch_count > MAX_SWITCH_PER_SESSION:
@@ -871,7 +856,6 @@ def _try_renew_session(page, attempt, initial_days):
         if not result:
             return None
 
-        # ⭐ v18: 只有真正提交答案后才递增策略索引
         ALIGN_STATE["counter"] += 1
         page.wait_for_timeout(600)
 
@@ -880,7 +864,8 @@ def _try_renew_session(page, attempt, initial_days):
     return None
 
 
-def try_renew_captcha(page, initial_days, max_attempts=4):
+def try_renew_captcha(page, initial_days, max_attempts=6):
+    # ⭐ v19: 增加到 6 次会话，覆盖更多策略
     for attempt in range(1, max_attempts + 1):
         _reset_align_pick()
         try:
@@ -953,7 +938,7 @@ def get_vps_urls(page):
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期 (v18 - sub 优先 + fail_pending + rotate 阈值)")
+    print("   Openworld VPS 自动续期 (v19 - none 优先 / odd 走切换 / WS 关闭感知)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
