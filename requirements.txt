@@ -1,5 +1,4 @@
-playwright
-requests
-Pillow
-numpy
-opencv-python-headless
+patchright==1.49.1
+requests==2.32.3
+numpy==2.1.3
+opencv-python-headless==4.10.0.84
