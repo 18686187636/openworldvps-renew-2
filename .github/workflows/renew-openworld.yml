@@ -1,92 +1,283 @@
-name: Auto Renew Openworld VPS
+# ============================================================
+# Openworld VPS 自动续期 — GitHub Actions 工作流
+# ============================================================
+
+name: Openworld VPS 自动续期
 
 on:
   schedule:
-    - cron: '0 2 */2 * *'
+    # 每天 02:23 UTC（北京时间 10:23）自动执行
+    - cron: '15 0 * * *'
   workflow_dispatch:
+    inputs:
+      use_proxy:
+        description: '是否使用 NODE_LINK 代理（默认 true）'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
 
 jobs:
-  Renew-openworld:
+  renew:
+    name: 续期
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      actions: write
-      contents: read
+    timeout-minutes: 40
+
+    env:
+      SING_BOX_VERSION: "1.10.7"
+      SING_BOX_DIR: "sing-box-install"
 
     steps:
-      - name: 📥 检出仓库
-        uses: actions/checkout@v4.2.2
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-      - name: ⚙️ 设置 Python
-        uses: actions/setup-python@v5.4.0
+      - name: 设置 Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           cache: 'pip'
 
-      - name: 🛠️ 安装系统依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            xvfb \
-            fonts-noto-cjk \
-            libgl1 \
-            libglib2.0-0
-
-      - name: 🐍 安装 Python 依赖
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          pip install playwright requests numpy opencv-python-headless
 
-      - name: 🚀 运行 Openworld 续期脚本
+      # ---------- 代理（NODE_LINK 私密 Secret，vless）----------
+      # 只在 use_proxy=true（或定时触发）且 NODE_LINK 存在时启用。
+      # sing-box 配置写进 sing-box-config.json（临时工作区），
+      # NODE_LINK 仅经 step 的 env 传入 run 块，不留在 checkout 代码目录。
+
+      - name: Configure sing-box proxy
+        if: >-
+          (inputs.use_proxy || github.event_name == 'schedule')
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          set -e
+
+          if [ -z "$NODE_LINK" ]; then
+            echo "⚠️ NODE_LINK 未配置，跳过 sing-box 代理，直连运行"
+            echo "USE_PROXY=false" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64)  SB_ARCH="amd64" ;;
+            aarch64|arm64) SB_ARCH="arm64" ;;
+            *) echo "❌ 不支持的架构: $ARCH"; exit 1 ;;
+          esac
+
+          PKG="sing-box-${SING_BOX_VERSION}-linux-${SB_ARCH}"
+          URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${PKG}.tar.gz"
+
+          echo "⬇️ 下载 sing-box: $URL"
+
+          download_ok=0
+          for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
+            echo "  尝试: ${PREFIX}${URL}"
+            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 \
+                 -o sing-box.tar.gz "${PREFIX}${URL}"; then
+              if file sing-box.tar.gz | grep -q 'gzip compressed data'; then
+                echo "  ✅ 下载成功 (${PREFIX:-direct})"
+                download_ok=1
+                break
+              else
+                echo "  ⚠️ 文件不是 gzip，继续尝试下一个源"
+                rm -f sing-box.tar.gz
+              fi
+            fi
+          done
+
+          if [ "$download_ok" != "1" ]; then
+            echo "❌ sing-box 所有下载源均失败"
+            exit 1
+          fi
+
+          tar -xzf sing-box.tar.gz
+          SING_BOX_DIR="$(find . -maxdepth 1 -type d -name "sing-box-${SING_BOX_VERSION}-*" | head -1)"
+          if [ -z "$SING_BOX_DIR" ]; then
+            echo "❌ 解压后未找到 sing-box 目录"
+            ls -la
+            exit 1
+          fi
+          mv "${SING_BOX_DIR}/sing-box" ./sing-box-bin
+          chmod +x ./sing-box-bin
+          rm -rf sing-box.tar.gz "${SING_BOX_DIR}"
+          ./sing-box-bin version
+
+          echo "📝 解析 vless 链接并生成配置..."
+          python3 << 'PYEOF'
+          import json, sys, os
+          from urllib.parse import urlparse, parse_qs
+
+          link = os.environ.get('NODE_LINK', '')
+          if not link:
+            sys.exit(0)
+
+          parsed = urlparse(link)
+          if parsed.scheme != 'vless':
+              print(f"⚠️ 不支持的协议: {parsed.scheme}，跳过代理")
+              sys.exit(0)
+
+          netloc = parsed.netloc
+          if '@' in netloc:
+              uuid, host_port = netloc.split('@', 1)
+          else:
+              uuid, host_port = '', netloc
+
+          host = ''
+          port = '443'
+          import re
+          bracket_match = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
+          if bracket_match:
+              host = bracket_match.group(1)
+              if bracket_match.group(2):
+                  port = bracket_match.group(2)
+          else:
+              if ':' in host_port:
+                  host, port = host_port.rsplit(':', 1)
+              else:
+                  host = host_port
+
+          if not host:
+              print(f"❌ 无法解析 host: {host_port}")
+              sys.exit(1)
+
+          params = parse_qs(parsed.query)
+          sni = params.get('sni', [host])[0] or host
+          fp  = params.get('fp', ['chrome'])[0] or 'chrome'
+          flow = params.get('flow', [''])[0] or ''
+          type_ = params.get('type', ['tcp'])[0]
+          security = params.get('security', [''])[0]
+          path = params.get('path', [''])[0]
+          host_header = params.get('host', [host])[0] or host
+
+          outbound = {
+              "type": "vless",
+              "tag": "vless-out",
+              "server": host,
+              "server_port": int(port),
+              "uuid": uuid,
+              "packet_encoding": "packetaddr",
+          }
+          if flow:
+              outbound["flow"] = flow
+
+          if security and security.lower() != 'none':
+              tls = {
+                  "enabled": True,
+                  "server_name": sni,
+                  "insecure": False,
+                  "utls": {"enabled": True, "fingerprint": fp}
+              }
+              if security.lower() == 'reality':
+                  pbk = params.get('pbk', [''])[0]
+                  sid = params.get('sid', [''])[0]
+                  tls["reality"] = {"enabled": True, "public_key": pbk, "short_id": sid}
+              outbound["tls"] = tls
+
+          if type_ != 'tcp':
+              transport = {"type": type_}
+              if type_ == 'ws':
+                  transport["path"] = path or "/"
+                  transport["headers"] = {"Host": host_header}
+              elif type_ == 'grpc':
+                  transport["service_name"] = path or ""
+              outbound["transport"] = transport
+
+          config = {
+              "log": {"level": "warn"},
+              "inbounds": [
+                  {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
+                  {"type": "http",  "tag": "http-in",  "listen": "127.0.0.1", "listen_port": 1081}
+              ],
+              "outbounds": [outbound],
+              "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}
+          }
+
+          with open("sing-box-config.json", "w") as f:
+              json.dump(config, f, indent=2)
+          print("✅ sing-box-config.json 已生成")
+          PYEOF
+
+          echo "🚀 启动 sing-box..."
+          nohup ./sing-box-bin run -c sing-box-config.json > sing-box.log 2>&1 &
+          SING_BOX_PID=$!
+          echo "SING_BOX_PID=${SING_BOX_PID}" >> $GITHUB_ENV
+          sleep 5
+          if ss -tuln | grep -q ':1080'; then
+            echo "✅ SOCKS5 代理已启动 (127.0.0.1:1080)"
+            echo "✅ HTTP  代理已启动 (127.0.0.1:1081)"
+            # 检测出口 IP，确认流量真的走了代理（对比直连与代理两个出口）
+            DIRECT_IP="$(curl -s --max-time 8 https://api.ipify.org || echo 'unknown')"
+            PROXY_IP="$(curl -s --max-time 15 -x http://127.0.0.1:1081 https://api.ipify.org || echo 'unknown')"
+            echo "📡 直连出口 IP: $DIRECT_IP"
+            echo "📡 代理出口 IP: $PROXY_IP"
+            if [ "$PROXY_IP" = "unknown" ]; then
+              echo "❌ 代理出口 IP 检测失败，代理可能没生效"
+              cat sing-box.log
+              exit 1
+            fi
+            echo "USE_PROXY=true" >> $GITHUB_ENV
+          else
+            echo "❌ 代理启动失败，日志如下:"
+            cat sing-box.log
+            exit 1
+          fi
+
+      - name: 缓存 Playwright
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-py311-v1
+          restore-keys: |
+            playwright-chromium-py311-
+
+      - name: 安装 Chromium（含系统依赖）
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
+
+      - name: 运行续期脚本
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           TG_BOT_TOKEN:  ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
           ACCOUNT_NAME:  ${{ secrets.ACCOUNT_NAME }}
-          HEADLESS: "true"
-          SCREENSHOT_DIR: "."
+          # 代理启用时：
+          #   - Chromium 走本地 sing-box SOCKS5 (CHROME_PROXY，Playwright 内部处理)
+          #   - 脚本里 requests (Discord OAuth / Telegram) 走 sing-box 的 HTTP 代理端口 1081
+          #     （requests 走 HTTP 代理不需要 PySocks；若设成 socks5h 会报
+          #     "Missing dependencies for SOCKS support"）
+          CHROME_PROXY: socks5://127.0.0.1:1080
+          HTTP_PROXY:  http://127.0.0.1:1081
+          HTTPS_PROXY: http://127.0.0.1:1081
+          NO_PROXY: 127.0.0.1,localhost
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" \
-            python3 apprenew.py
+          if [ "$USE_PROXY" = "true" ]; then
+            echo "代理已启用：Chromium 走 ${CHROME_PROXY}，requests 走 ${HTTP_PROXY}"
+          else
+            echo "直连模式（未使用代理）"
+            # 直连时清掉代理变量，避免脚本误读
+            unset CHROME_PROXY HTTP_PROXY HTTPS_PROXY
+          fi
+          python apprenew.py
 
-      - name: 💾 上传验证码与诊断文件
+      - name: 停止 sing-box
+        if: always() && env.USE_PROXY == 'true'
+        run: |
+          if [ -n "${SING_BOX_PID:-}" ] && kill -0 "${SING_BOX_PID}" 2>/dev/null; then
+            kill "${SING_BOX_PID}" 2>/dev/null || true
+            echo "sing-box 已停止"
+          fi
+
+      - name: 上传截图（失败也保留，方便排查）
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
-          name: captcha-debug-${{ github.run_number }}
-          path: |
-            captcha_*.png
-            captcha_*.gif
-            *.html
-            login_*.png
-            vps_*.png
-            after_renew_*.png
-            uncaught_error.png
+          name: screenshots-${{ github.run_id }}
+          path: screenshots/
           if-no-files-found: ignore
-          retention-days: 3
-
-      - name: 🧽 清理进程
-        if: always()
-        run: |
-          pkill -f chromium || true
-          pkill -f Xvfb || true
-          pkill -f "playwright" || true
-
-      - name: 🧹 清理旧的工作流运行记录（保留最近 30 条）
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set +e
-          gh run list \
-            --workflow="${{ github.workflow }}" \
-            --limit=100 \
-            --json databaseId \
-            --jq 'sort_by(.databaseId) | reverse | .[30:][] | .databaseId' \
-          | while read -r run_id; do
-              [ -z "$run_id" ] && continue
-              echo "🗑️ 删除运行记录: $run_id"
-              gh run delete "$run_id" || true
-            done
-          set -e
+          retention-days: 7
