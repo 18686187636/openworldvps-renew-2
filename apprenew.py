@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v24-github: 12 次重试 + 短冷却 + rotate 失败直接退会话（不切换）
+
 
 import os
 import re
