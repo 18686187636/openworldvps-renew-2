@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v23-github: 回退 fail 等待、rotate 质心旋转、match 策略可切换
+# v24-github: 12 次重试 + 短冷却 + rotate 失败直接退会话（不切换）
 
 import os
 import re
@@ -34,7 +34,6 @@ CONFIG = {
     "HEADLESS": True,
     "SCREENSHOT_DIR": "./screenshots",
     "RENEW_THRESHOLD_DAYS": 5,
-    # ★ 新增：match 配对策略 "same"(相似) | "diff"(互补)
     "MATCH_STRATEGY": os.environ.get("MATCH_STRATEGY", "same").strip().lower(),
 }
 
@@ -485,7 +484,6 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
 
 
 def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
-    """★ v23: 绕形状质心旋转，而非图像几何中心。"""
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
@@ -527,7 +525,7 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
 
     ch, cw = chip_gray.shape
 
-    # ★★ v23: 用形状质心作为旋转中心（不是图像几何中心）
+    # ★ v23: 用形状质心作为旋转中心
     solid_ys, solid_xs = np.where(chip_mask > 100)
     if len(solid_xs) > 0:
         shape_cx = float(solid_xs.mean())
@@ -549,7 +547,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
         cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
         nw = int(np.ceil(ch * sin_a + cw * cos_a))
         nh = int(np.ceil(ch * cos_a + cw * sin_a))
-        # 把旋转中心（形状质心）移到新图中心
         M[0, 2] += nw / 2.0 - shape_cx
         M[1, 2] += nh / 2.0 - shape_cy
         rot = cv2.warpAffine(chip_gray, M, (nw, nh),
@@ -619,7 +616,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     if best_off_x or best_off_y:
         print(f"   🔧 平移细化: off=({best_off_x:+d},{best_off_y:+d}) ncc={best_score:.3f}")
 
-    # ★★ v23: 180° 消歧阈值放宽到 0.08
     alt = (best_angle + 180) % 360
     alt_score = all_scores.get(alt, _score(alt)[0])
     print(f"   📐 双峰: best={best_angle}° ncc={best_score:.3f} | "
@@ -631,8 +627,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
         best_px, best_py = px, py
         print(f"   🔀 采用 alt={alt}° (ncc {alt_score:.3f} 显著高于 {best_score:.3f})")
     elif abs(alt_score - best_score) < 0.08:
-        # ★ 两峰接近时，选 180° 中"逆时针方向较小"的（通常真图是正向）
-        # 这只是一个启发式，未必准，但比随机好
         choose_alt = best_angle > 180
         if choose_alt:
             s, rot, rot_m, px, py = _score(alt)
@@ -671,7 +665,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
 
 
 def _solve_odd(bg_bytes, meta):
-    """★ v23: 颜色分支要求 dist > 2×mean，否则强制走形状。"""
     bg = _decode(bg_bytes)
     if bg is None:
         raise RuntimeError("解码失败")
@@ -697,14 +690,12 @@ def _solve_odd(bg_bytes, meta):
 
     ci = int(np.argmax(dists))
     mean_d = float(np.mean(dists))
-    # ★★ v23: 加严颜色阈值 —— dist 必须 > 2×mean
     color_threshold = max(mean_d * 2.0, 220.0)
     if dists[ci] > color_threshold:
         print(f"   🎨 odd 颜色异类: item#{ci} {items[ci]} "
               f"dist={dists[ci]:.1f} avg={mean_d:.1f} thr={color_threshold:.1f}")
         return ci
 
-    # 颜色无显著差异 → 形状
     gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
     patches = []
     for it in items:
@@ -730,7 +721,6 @@ def _solve_odd(bg_bytes, meta):
 
 
 def _match_map_calc(bg_bytes, meta, strategy=None):
-    """★ v23: 支持 same(相似) / diff(互补) 两种配对策略。"""
     if strategy is None:
         strategy = MATCH_STRATEGY
     bg = _decode(bg_bytes)
@@ -772,10 +762,8 @@ def _match_map_calc(bg_bytes, meta, strategy=None):
     used = set()
     for i in range(3):
         if strategy == "diff":
-            # 互补：选 NCC 最低的
-            sims = sorted([(mat[i][j], j) for j in range(3)])  # 升序
+            sims = sorted([(mat[i][j], j) for j in range(3)])
         else:
-            # 相似：选 NCC 最高的
             sims = sorted([(mat[i][j], j) for j in range(3)], reverse=True)
         for _, j in sims:
             if j not in used:
@@ -1030,17 +1018,9 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
         try:
             value = _solve_rotate(frames[0], frames[1], meta, tag=tag)
             if value < 0:
-                print(f"   ⚠️ rotate 求解失败（NCC 过低），尝试切换 {alt}")
-                if alt in SUPPORTED_KINDS:
-                    try:
-                        btn = page.locator("#captcha_switch_default").first
-                        if btn.is_visible(timeout=1500):
-                            page.wait_for_timeout(random.randint(900, 1800))
-                            btn.click()
-                            print(f"   🔁 切换类型: rotate → {alt}")
-                            return "switched"
-                    except Exception as e2:
-                        print(f"   ⚠️ 切换失败: {e2}")
+                # ★ v24: rotate 求解失败直接退会话，不在同一会话反复切换
+                #   —— 切换本身是行为风险信号，会拉低 hum 分
+                print(f"   ⚠️ rotate 求解失败（NCC 过低），直接退会话（不切换）")
                 return False
             print(f"   🎯 value={value} vmax={meta.get('vmax')}")
             _drag_slider(page, value, int(meta.get("vmax") or 359))
@@ -1077,7 +1057,6 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
 # ================= 多 stage 会话 =================
 
 def _try_renew_session(page, attempt, initial_days):
-    """★ v23: fail 后立即退会话（服务端不重连）。"""
     print(f"\n   {'='*40}\n   🔄 第 {attempt} 次会话\n   {'='*40}")
 
     try:
@@ -1108,7 +1087,7 @@ def _try_renew_session(page, attempt, initial_days):
     max_total = 300
 
     while time.time() - start < max_total:
-        # ★★ v23: WS closed 时立即退会话（回退 v22 的 12s 等待）
+        # WS closed 时立即退会话
         if WS_STATE.get("closed"):
             print("   ⚠️ WS 已关闭，退出会话")
             return None
@@ -1117,7 +1096,7 @@ def _try_renew_session(page, attempt, initial_days):
             WS_STATE["fail_pending"] = False
             fail_count += 1
             print(f"   ⚠️ 答案被拒 (fail #{fail_count}/{MAX_FAIL_PER_SESSION})")
-            # ★★ v23: fail 后立即退会话
+            # fail 后立即退会话
             return None
 
         resp = WS_STATE["last_resp"]
@@ -1258,7 +1237,8 @@ def _try_renew_session(page, attempt, initial_days):
     return None
 
 
-def try_renew_captcha(page, initial_days, max_attempts=6):
+def try_renew_captcha(page, initial_days, max_attempts=12):
+    """★ v24: 12 次重试 + 短冷却（1.5–3s）。"""
     for attempt in range(1, max_attempts + 1):
         _reset_align_pick()
         try:
@@ -1277,11 +1257,11 @@ def try_renew_captcha(page, initial_days, max_attempts=6):
             try:
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(500)
-                # ★ v23: 冷却 3-6s（比 v22 短，因为 fail 后立即退会话）
-                page.wait_for_timeout(random.randint(3000, 6000))
+                # ★ v24: 冷却从 3-6s 缩到 1.5-3s
+                page.wait_for_timeout(random.randint(1500, 3000))
                 page.reload(wait_until="domcontentloaded", timeout=30000)
                 wait_for_cloudflare(page)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(2000)   # reload 后等待从 3s 降到 2s
             except Exception as e:
                 print(f"   ⚠️ 刷新: {e}")
 
@@ -1349,7 +1329,7 @@ def check_config():
 
 def main() -> int:
     print("#" * 60)
-    print("   Openworld VPS 自动续期 (v23-github)")
+    print("   Openworld VPS 自动续期 (v24-github)")
     print("#" * 60)
 
     if not check_config():
