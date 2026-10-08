@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v22-github: fail 后重试、match 诊断、会话利用最大化
+# v23-github: 回退 fail 等待、rotate 质心旋转、match 策略可切换
 
 import os
 import re
@@ -34,6 +34,8 @@ CONFIG = {
     "HEADLESS": True,
     "SCREENSHOT_DIR": "./screenshots",
     "RENEW_THRESHOLD_DAYS": 5,
+    # ★ 新增：match 配对策略 "same"(相似) | "diff"(互补)
+    "MATCH_STRATEGY": os.environ.get("MATCH_STRATEGY", "same").strip().lower(),
 }
 
 DISCORD_TOKEN = CONFIG["DISCORD_TOKEN"]
@@ -45,6 +47,7 @@ SITE_BASE     = CONFIG["SITE_BASE"]
 HEADLESS      = CONFIG["HEADLESS"]
 SCREENSHOT_DIR = CONFIG["SCREENSHOT_DIR"]
 RENEW_THRESHOLD_DAYS = CONFIG["RENEW_THRESHOLD_DAYS"]
+MATCH_STRATEGY = CONFIG["MATCH_STRATEGY"]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if not os.path.isabs(SCREENSHOT_DIR):
@@ -76,9 +79,7 @@ STEALTH_JS = r"""
     });
   } catch(e) {}
   try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en','zh-CN'] }); } catch(e) {}
-  try {
-    if (!window.chrome) window.chrome = { runtime:{}, loadTimes:function(){}, csi:function(){}, app:{} };
-  } catch(e) {}
+  try { if (!window.chrome) window.chrome = { runtime:{}, loadTimes:function(){}, csi:function(){}, app:{} }; } catch(e) {}
   ['__selenium_unwrapped','__webdriver_evaluate','__selenium_evaluate','__driver_evaluate',
    '__fxdriver_evaluate','_Selenium_IDE_Recorder','__webdriver_script_fn','__webdriver_script_func',
    '__webdriver_script_url','__driver_script_fn','__driver_script_url','_phantom','__nightmare',
@@ -156,8 +157,6 @@ def _install_ws_hook(page):
     page.on("websocket", on_ws)
 
 
-# ================= 工具 =================
-
 def send_telegram_message(message: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print(f"   📢 [本地] {message}")
@@ -203,8 +202,6 @@ def wait_for_cloudflare(page, timeout=15):
         time.sleep(1)
     return False
 
-
-# ================= Discord OAuth 登录 =================
 
 def login_with_discord_token(page, dc_token: str) -> bool:
     print("=" * 50)
@@ -377,8 +374,6 @@ def _chip_shape(chip):
     return {
         "w": cx1 - cx0, "h": cy1 - cy0,
         "circ": circ, "nv": len(approx),
-        "alpha_x0": cx0, "alpha_y0": cy0,
-        "alpha_x1": cx1, "alpha_y1": cy1,
         "alpha_cx": (cx0 + cx1) / 2.0,
         "alpha_cy": (cy0 + cy1) / 2.0,
     }
@@ -490,6 +485,7 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
 
 
 def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
+    """★ v23: 绕形状质心旋转，而非图像几何中心。"""
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
@@ -530,7 +526,17 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
         chip_mask = chip_alpha
 
     ch, cw = chip_gray.shape
-    ccx, ccy = cw / 2.0, ch / 2.0
+
+    # ★★ v23: 用形状质心作为旋转中心（不是图像几何中心）
+    solid_ys, solid_xs = np.where(chip_mask > 100)
+    if len(solid_xs) > 0:
+        shape_cx = float(solid_xs.mean())
+        shape_cy = float(solid_ys.mean())
+    else:
+        shape_cx, shape_cy = cw / 2.0, ch / 2.0
+    print(f"   🌀 旋转中心: 形状质心 ({shape_cx:.1f},{shape_cy:.1f}) "
+          f"vs 几何中心 ({cw/2:.1f},{ch/2:.1f})")
+
     tgt_cx = (ox + ow / 2.0) - x0
     tgt_cy = (oy + oh / 2.0) - y0
 
@@ -539,12 +545,13 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     def _get_rot(angle):
         if angle in rot_cache:
             return rot_cache[angle]
-        M = cv2.getRotationMatrix2D((ccx, ccy), angle, 1.0)
+        M = cv2.getRotationMatrix2D((shape_cx, shape_cy), angle, 1.0)
         cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
         nw = int(np.ceil(ch * sin_a + cw * cos_a))
         nh = int(np.ceil(ch * cos_a + cw * sin_a))
-        M[0, 2] += nw / 2.0 - ccx
-        M[1, 2] += nh / 2.0 - ccy
+        # 把旋转中心（形状质心）移到新图中心
+        M[0, 2] += nw / 2.0 - shape_cx
+        M[1, 2] += nh / 2.0 - shape_cy
         rot = cv2.warpAffine(chip_gray, M, (nw, nh),
                              flags=cv2.INTER_LINEAR, borderValue=0)
         rot_m = cv2.warpAffine(chip_mask, M, (nw, nh),
@@ -612,16 +619,30 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     if best_off_x or best_off_y:
         print(f"   🔧 平移细化: off=({best_off_x:+d},{best_off_y:+d}) ncc={best_score:.3f}")
 
+    # ★★ v23: 180° 消歧阈值放宽到 0.08
     alt = (best_angle + 180) % 360
     alt_score = all_scores.get(alt, _score(alt)[0])
-    if alt_score > best_score + 0.03:
+    print(f"   📐 双峰: best={best_angle}° ncc={best_score:.3f} | "
+          f"alt={alt}° ncc={alt_score:.3f}")
+    if alt_score > best_score + 0.08:
         s, rot, rot_m, px, py = _score(alt)
         best_score, best_angle = s, alt
         best_rot, best_rot_m = rot, rot_m
         best_px, best_py = px, py
-        print(f"   🔀 对称消歧: 采用 {alt}° (ncc={alt_score:.3f}) 替代 {best_angle}°")
-    elif abs(alt_score - best_score) < 0.05:
-        print(f"   🔀 180° 双峰接近 (ncc={best_score:.3f}/{alt_score:.3f})，保留 {best_angle}°")
+        print(f"   🔀 采用 alt={alt}° (ncc {alt_score:.3f} 显著高于 {best_score:.3f})")
+    elif abs(alt_score - best_score) < 0.08:
+        # ★ 两峰接近时，选 180° 中"逆时针方向较小"的（通常真图是正向）
+        # 这只是一个启发式，未必准，但比随机好
+        choose_alt = best_angle > 180
+        if choose_alt:
+            s, rot, rot_m, px, py = _score(alt)
+            best_score, best_angle = s, alt
+            best_rot, best_rot_m = rot, rot_m
+            best_px, best_py = px, py
+            print(f"   🔀 双峰接近 (diff={abs(alt_score-best_score):.3f})，"
+                  f"启发式选 {alt}°")
+        else:
+            print(f"   🔀 双峰接近 (diff={abs(alt_score-best_score):.3f})，保留 {best_angle}°")
 
     print(f"   🎯 rotate: 逆时针={best_angle}° ncc={best_score:.3f}")
 
@@ -650,7 +671,7 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
 
 
 def _solve_odd(bg_bytes, meta):
-    """★ 返回索引而非 x 坐标。★ v22: 颜色阈值提高到 max(1.5×mean, 180)。"""
+    """★ v23: 颜色分支要求 dist > 2×mean，否则强制走形状。"""
     bg = _decode(bg_bytes)
     if bg is None:
         raise RuntimeError("解码失败")
@@ -676,8 +697,8 @@ def _solve_odd(bg_bytes, meta):
 
     ci = int(np.argmax(dists))
     mean_d = float(np.mean(dists))
-    # ★★ 提高阈值：要求绝对差 >180 且 >1.5×均值，才判定为"颜色异类"
-    color_threshold = max(mean_d * 1.5, 180.0)
+    # ★★ v23: 加严颜色阈值 —— dist 必须 > 2×mean
+    color_threshold = max(mean_d * 2.0, 220.0)
     if dists[ci] > color_threshold:
         print(f"   🎨 odd 颜色异类: item#{ci} {items[ci]} "
               f"dist={dists[ci]:.1f} avg={mean_d:.1f} thr={color_threshold:.1f}")
@@ -704,12 +725,14 @@ def _solve_odd(bg_bytes, meta):
         scores.append(float((av * bv).sum() / d) if d > 1e-6 else 0.0)
     si = int(np.argmin(scores))
     print(f"   🎨 odd 形状异类: item#{si} {items[si]} ncc={scores[si]:.3f} "
-          f"(颜色阈值未过: {dists[ci]:.1f} vs thr {color_threshold:.1f})")
+          f"(颜色未过阈: {dists[ci]:.1f} vs thr {color_threshold:.1f})")
     return si
 
 
-def _match_map_calc(bg_bytes, meta):
-    """★ v22: 打印完整 3×3 NCC 矩阵，便于诊断配对是否明确。"""
+def _match_map_calc(bg_bytes, meta, strategy=None):
+    """★ v23: 支持 same(相似) / diff(互补) 两种配对策略。"""
+    if strategy is None:
+        strategy = MATCH_STRATEGY
     bg = _decode(bg_bytes)
     if bg is None:
         raise RuntimeError("解码失败")
@@ -739,12 +762,8 @@ def _match_map_calc(bg_bytes, meta):
         d = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
         return float((av * bv).sum() / d) if d > 1e-6 else 0.0
 
-    # ★★ 打印 3×3 NCC 矩阵
-    mat = [[0.0]*3 for _ in range(3)]
-    for i in range(3):
-        for j in range(3):
-            mat[i][j] = _ncc(lp[i], rp[j])
-    print(f"   📊 NCC 矩阵:      r0      r1      r2")
+    mat = [[_ncc(lp[i], rp[j]) for j in range(3)] for i in range(3)]
+    print(f"   📊 NCC 矩阵 (策略={strategy}):  r0      r1      r2")
     for i in range(3):
         row = "  ".join(f"{mat[i][j]:+.2f}" for j in range(3))
         print(f"      l{i}: {row}")
@@ -752,7 +771,12 @@ def _match_map_calc(bg_bytes, meta):
     match_map = []
     used = set()
     for i in range(3):
-        sims = sorted([(mat[i][j], j) for j in range(3)], reverse=True)
+        if strategy == "diff":
+            # 互补：选 NCC 最低的
+            sims = sorted([(mat[i][j], j) for j in range(3)])  # 升序
+        else:
+            # 相似：选 NCC 最高的
+            sims = sorted([(mat[i][j], j) for j in range(3)], reverse=True)
         for _, j in sims:
             if j not in used:
                 used.add(j)
@@ -839,7 +863,6 @@ def _click_captcha_point(page, x, y):
 
 
 def _click_match_pairs(page, meta, match_map):
-    """★ v22: 接受已算好的 match_map；hover 用 _hover_to 有中间轨迹。"""
     left = meta.get("left") or []
     right = meta.get("right") or []
     if len(left) != 3 or len(right) != 3:
@@ -862,14 +885,13 @@ def _click_match_pairs(page, meta, match_map):
         page.mouse.down()
         page.wait_for_timeout(hold)
         page.mouse.up()
-        if random.random() < 0.15:  # ★ 从 0.30 降到 0.15
+        if random.random() < 0.15:
             page.wait_for_timeout(random.randint(80, 200))
             page.mouse.down()
             page.wait_for_timeout(random.randint(50, 130))
             page.mouse.up()
 
     for i in range(3):
-        # ★ hover 改走 _hover_to（带中间轨迹），而不是 mouse.move 瞬移
         hx = bb["x"] + bb["width"] * random.uniform(0.15, 0.85)
         hy = bb["y"] + bb["height"] * random.uniform(0.15, 0.85)
         _hover_to(page, hx, hy)
@@ -1039,7 +1061,6 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
                 print(f"   🖱️ odd 点击 item#{si} ({item['x']},{item['y']})")
                 _click_captcha_point(page, item["x"], item["y"])
             else:
-                # ★★ 只算一次 match_map，避免重复
                 mm = _match_map_calc(frames[0], meta)
                 ans = mm[0] * 100 + mm[1] * 10 + mm[2]
                 print(f"   🖱️ match ans={ans}")
@@ -1056,7 +1077,7 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
 # ================= 多 stage 会话 =================
 
 def _try_renew_session(page, attempt, initial_days):
-    """★ v22: fail / WS closed 后不再立即退会话，给服务端重连窗口。"""
+    """★ v23: fail 后立即退会话（服务端不重连）。"""
     print(f"\n   {'='*40}\n   🔄 第 {attempt} 次会话\n   {'='*40}")
 
     try:
@@ -1086,40 +1107,18 @@ def _try_renew_session(page, attempt, initial_days):
     start = time.time()
     max_total = 300
 
-    # ★★ 追踪 meta 变化，WS 关闭后判断是否"长时间无新题"
-    last_meta_id = None
-    last_meta_time = time.time()
-
     while time.time() - start < max_total:
-        # ★★ 追踪新 meta
-        cur_meta = WS_STATE.get("meta")
-        cur_meta_id = cur_meta.get("id") if cur_meta else None
-        if cur_meta_id and cur_meta_id != last_meta_id:
-            last_meta_id = cur_meta_id
-            last_meta_time = time.time()
-
-        # ★★ 只在"WS closed 且 12s 内没有新 meta"才退会话
+        # ★★ v23: WS closed 时立即退会话（回退 v22 的 12s 等待）
         if WS_STATE.get("closed"):
-            since = time.time() - last_meta_time
-            if since > 12:
-                print(f"   ⚠️ WS 关闭 {since:.1f}s 无新题，退出会话")
-                return None
-            # 否则：短等待，让服务端重连推题
-            page.wait_for_timeout(500)
-            continue
+            print("   ⚠️ WS 已关闭，退出会话")
+            return None
 
         if WS_STATE.get("fail_pending"):
             WS_STATE["fail_pending"] = False
             fail_count += 1
             print(f"   ⚠️ 答案被拒 (fail #{fail_count}/{MAX_FAIL_PER_SESSION})")
-            if fail_count >= MAX_FAIL_PER_SESSION:
-                print(f"   ⚠️ fail 次数达上限，退出会话")
-                return None
-            handled_fps.clear()
-            WS_STATE["frames"] = []
-            # ★★ 不再因 closed 退出；给服务端 1s 发新题
-            page.wait_for_timeout(1000)
-            continue
+            # ★★ v23: fail 后立即退会话
+            return None
 
         resp = WS_STATE["last_resp"]
 
@@ -1278,8 +1277,8 @@ def try_renew_captcha(page, initial_days, max_attempts=6):
             try:
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(500)
-                # ★★ 冷却从 2-4s 延到 5-10s
-                page.wait_for_timeout(random.randint(5000, 10000))
+                # ★ v23: 冷却 3-6s（比 v22 短，因为 fail 后立即退会话）
+                page.wait_for_timeout(random.randint(3000, 6000))
                 page.reload(wait_until="domcontentloaded", timeout=30000)
                 wait_for_cloudflare(page)
                 page.wait_for_timeout(3000)
@@ -1289,8 +1288,6 @@ def try_renew_captcha(page, initial_days, max_attempts=6):
     print(f"   ❌ {max_attempts} 次会话均失败")
     return False
 
-
-# ================= VPS 列表 =================
 
 def get_vps_urls(page):
     def extract():
@@ -1330,35 +1327,29 @@ def get_vps_urls(page):
     return urls
 
 
-# ================= 配置检查 =================
-
 def check_config():
     print("=" * 50)
     print("⚙️  配置检查")
     print("=" * 50)
-    print(f"   DISCORD_TOKEN : {'✅ 已设置 (' + DISCORD_TOKEN[:12] + '...)' if DISCORD_TOKEN else '❌ 空'}")
-    print(f"   TG 通知       : {'✅ 已启用' if (TG_BOT_TOKEN and TG_CHAT_ID) else '⚪ 未启用（跳过）'}")
-    print(f"   SITE_BASE     : {SITE_BASE}")
-    print(f"   运行模式      : {'✅ 无头' if HEADLESS else '❌ 有头'}")
-    print(f"   截图目录      : {SCREENSHOT_DIR}")
+    print(f"   DISCORD_TOKEN  : {'✅ 已设置' if DISCORD_TOKEN else '❌ 空'}")
+    print(f"   TG 通知        : {'✅ 已启用' if (TG_BOT_TOKEN and TG_CHAT_ID) else '⚪ 未启用'}")
+    print(f"   SITE_BASE      : {SITE_BASE}")
+    print(f"   运行模式       : {'✅ 无头' if HEADLESS else '❌ 有头'}")
+    print(f"   截图目录       : {SCREENSHOT_DIR}")
+    print(f"   MATCH_STRATEGY : {MATCH_STRATEGY}  (可改为 same / diff)")
 
     if not DISCORD_TOKEN:
         print()
         print("❌ 缺少 DISCORD_TOKEN")
         print("   请在 GitHub 仓库 → Settings → Secrets and variables → Actions")
-        print("   添加 Secret：")
-        print("     - DISCORD_TOKEN : 必填")
-        print("     - TG_BOT_TOKEN  : 可选（Telegram 机器人 token）")
-        print("     - TG_CHAT_ID    : 可选（Telegram 对话 id）")
+        print("   添加 Secret：DISCORD_TOKEN")
         return False
     return True
 
 
-# ================= main =================
-
 def main() -> int:
     print("#" * 60)
-    print("   Openworld VPS 自动续期 (v22-github)")
+    print("   Openworld VPS 自动续期 (v23-github)")
     print("#" * 60)
 
     if not check_config():
