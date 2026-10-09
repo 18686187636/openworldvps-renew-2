@@ -35,6 +35,10 @@ CONFIG = {
     "SCREENSHOT_DIR": "./screenshots",
     "RENEW_THRESHOLD_DAYS": 5,
     "MATCH_STRATEGY": os.environ.get("MATCH_STRATEGY", "same").strip().lower(),
+    # ★ 新增：rotate 方向
+    #   direct  → value = best_angle（假设服务端期望"chip 已转的角度"）
+    #   inverse → value = (360 - best_angle) % 360（假设服务端期望"要转回去的角度"）
+    "ROTATE_MODE": os.environ.get("ROTATE_MODE", "direct").strip().lower(),
 }
 
 DISCORD_TOKEN = CONFIG["DISCORD_TOKEN"]
@@ -47,6 +51,7 @@ HEADLESS      = CONFIG["HEADLESS"]
 SCREENSHOT_DIR = CONFIG["SCREENSHOT_DIR"]
 RENEW_THRESHOLD_DAYS = CONFIG["RENEW_THRESHOLD_DAYS"]
 MATCH_STRATEGY = CONFIG["MATCH_STRATEGY"]
+ROTATE_MODE = CONFIG["ROTATE_MODE"]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if not os.path.isabs(SCREENSHOT_DIR):
@@ -525,7 +530,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
 
     ch, cw = chip_gray.shape
 
-    # ★ v23: 用形状质心作为旋转中心
     solid_ys, solid_xs = np.where(chip_mask > 100)
     if len(solid_xs) > 0:
         shape_cx = float(solid_xs.mean())
@@ -661,7 +665,13 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
         print(f"   ⚠️ NCC {best_score:.3f} 低于提交阈值 {ROTATE_NCC_SUBMIT}，放弃提交")
         return -1
 
-    return (360 - best_angle) % 360
+    # ★★★ v25: 根据 ROTATE_MODE 决定返回值
+    if ROTATE_MODE == "inverse":
+        value = (360 - best_angle) % 360
+    else:
+        value = best_angle
+    print(f"   📤 返回 value={value} (mode={ROTATE_MODE})")
+    return value
 
 
 def _solve_odd(bg_bytes, meta):
@@ -690,7 +700,8 @@ def _solve_odd(bg_bytes, meta):
 
     ci = int(np.argmax(dists))
     mean_d = float(np.mean(dists))
-    color_threshold = max(mean_d * 2.0, 220.0)
+    # ★★★ v25: 回退到 1.5 倍阈值 —— 修复之前 2.0 倍导致异类 dist == threshold 的 bug
+    color_threshold = max(mean_d * 1.5, 180.0)
     if dists[ci] > color_threshold:
         print(f"   🎨 odd 颜色异类: item#{ci} {items[ci]} "
               f"dist={dists[ci]:.1f} avg={mean_d:.1f} thr={color_threshold:.1f}")
@@ -851,6 +862,7 @@ def _click_captcha_point(page, x, y):
 
 
 def _click_match_pairs(page, meta, match_map):
+    """★ v25: 强化行为 —— 瞄-犹豫-回-再点、长停顿、二次轻点。"""
     left = meta.get("left") or []
     right = meta.get("right") or []
     if len(left) != 3 or len(right) != 3:
@@ -863,8 +875,15 @@ def _click_match_pairs(page, meta, match_map):
         return px + random.gauss(0, 5), py + random.gauss(0, 5)
 
     def _human_click(px, py):
+        # ★ 先 hover 到目标附近（偏移 ±15px），停一下，再移到目标
+        near_x = px + random.uniform(-15, 15)
+        near_y = py + random.uniform(-15, 15)
+        _hover_to(page, near_x, near_y)
+        page.wait_for_timeout(random.randint(120, 280))
+        # 再精确移到目标
         _hover_to(page, px, py)
-        page.wait_for_timeout(random.randint(80, 220))
+        page.wait_for_timeout(random.randint(80, 200))
+
         hold = random.choices(
             [random.randint(60, 100),
              random.randint(120, 220),
@@ -873,33 +892,39 @@ def _click_match_pairs(page, meta, match_map):
         page.mouse.down()
         page.wait_for_timeout(hold)
         page.mouse.up()
-        if random.random() < 0.15:
+        # 偶发二次轻点
+        if random.random() < 0.20:
             page.wait_for_timeout(random.randint(80, 200))
             page.mouse.down()
             page.wait_for_timeout(random.randint(50, 130))
             page.mouse.up()
 
     for i in range(3):
+        # ★ 每次点击前，先在图上随机晃一下
         hx = bb["x"] + bb["width"] * random.uniform(0.15, 0.85)
         hy = bb["y"] + bb["height"] * random.uniform(0.15, 0.85)
         _hover_to(page, hx, hy)
         page.wait_for_timeout(random.randint(180, 420))
 
+        # 左卡
         lx, ly = _box_pos_to_page(page, left[i]["x"], left[i]["y"])
         lx, ly = _jitter(lx, ly)
         _human_click(lx, ly)
 
+        # ★ 左→右之间长停顿（模拟看图思考）
         if i == 1:
-            page.wait_for_timeout(random.randint(1200, 2000))
+            page.wait_for_timeout(random.randint(1400, 2200))
         else:
-            page.wait_for_timeout(random.randint(500, 1100))
+            page.wait_for_timeout(random.randint(600, 1200))
 
+        # 右卡
         rj = right[match_map[i]]
         rx, ry = _box_pos_to_page(page, rj["x"], rj["y"])
         rx, ry = _jitter(rx, ry)
         _human_click(rx, ry)
 
-        page.wait_for_timeout(random.randint(600, 1400))
+        # 每对之间停顿
+        page.wait_for_timeout(random.randint(700, 1500))
 
     page.wait_for_timeout(random.randint(600, 1100))
 
@@ -1018,9 +1043,18 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
         try:
             value = _solve_rotate(frames[0], frames[1], meta, tag=tag)
             if value < 0:
-                # ★ v24: rotate 求解失败直接退会话，不在同一会话反复切换
-                #   —— 切换本身是行为风险信号，会拉低 hum 分
-                print(f"   ⚠️ rotate 求解失败（NCC 过低），直接退会话（不切换）")
+                # ★★★ v25: 回退到 v23 行为 —— rotate 失败切 alt（保留会话）
+                print(f"   ⚠️ rotate 求解失败（NCC 过低），尝试切换 {alt}")
+                if alt in SUPPORTED_KINDS:
+                    try:
+                        btn = page.locator("#captcha_switch_default").first
+                        if btn.is_visible(timeout=1500):
+                            page.wait_for_timeout(random.randint(900, 1800))
+                            btn.click()
+                            print(f"   🔁 切换类型: rotate → {alt}")
+                            return "switched"
+                    except Exception as e2:
+                        print(f"   ⚠️ 切换失败: {e2}")
                 return False
             print(f"   🎯 value={value} vmax={meta.get('vmax')}")
             _drag_slider(page, value, int(meta.get("vmax") or 359))
@@ -1087,7 +1121,6 @@ def _try_renew_session(page, attempt, initial_days):
     max_total = 300
 
     while time.time() - start < max_total:
-        # WS closed 时立即退会话
         if WS_STATE.get("closed"):
             print("   ⚠️ WS 已关闭，退出会话")
             return None
@@ -1096,8 +1129,13 @@ def _try_renew_session(page, attempt, initial_days):
             WS_STATE["fail_pending"] = False
             fail_count += 1
             print(f"   ⚠️ 答案被拒 (fail #{fail_count}/{MAX_FAIL_PER_SESSION})")
-            # fail 后立即退会话
-            return None
+            if fail_count >= MAX_FAIL_PER_SESSION:
+                print(f"   ⚠️ fail 次数达上限，退出会话")
+                return None
+            handled_fps.clear()
+            WS_STATE["frames"] = []
+            page.wait_for_timeout(350)
+            continue
 
         resp = WS_STATE["last_resp"]
 
@@ -1238,7 +1276,7 @@ def _try_renew_session(page, attempt, initial_days):
 
 
 def try_renew_captcha(page, initial_days, max_attempts=12):
-    """★ v24: 12 次重试 + 短冷却（1.5–3s）。"""
+    """★ v25: 12 次重试 + 短冷却（1.5–3s）。"""
     for attempt in range(1, max_attempts + 1):
         _reset_align_pick()
         try:
@@ -1257,11 +1295,10 @@ def try_renew_captcha(page, initial_days, max_attempts=12):
             try:
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(500)
-                # ★ v24: 冷却从 3-6s 缩到 1.5-3s
                 page.wait_for_timeout(random.randint(1500, 3000))
                 page.reload(wait_until="domcontentloaded", timeout=30000)
                 wait_for_cloudflare(page)
-                page.wait_for_timeout(2000)   # reload 后等待从 3s 降到 2s
+                page.wait_for_timeout(2000)
             except Exception as e:
                 print(f"   ⚠️ 刷新: {e}")
 
@@ -1316,20 +1353,19 @@ def check_config():
     print(f"   SITE_BASE      : {SITE_BASE}")
     print(f"   运行模式       : {'✅ 无头' if HEADLESS else '❌ 有头'}")
     print(f"   截图目录       : {SCREENSHOT_DIR}")
-    print(f"   MATCH_STRATEGY : {MATCH_STRATEGY}  (可改为 same / diff)")
+    print(f"   MATCH_STRATEGY : {MATCH_STRATEGY}  (same / diff)")
+    print(f"   ROTATE_MODE    : {ROTATE_MODE}  (direct / inverse)")
 
     if not DISCORD_TOKEN:
         print()
         print("❌ 缺少 DISCORD_TOKEN")
-        print("   请在 GitHub 仓库 → Settings → Secrets and variables → Actions")
-        print("   添加 Secret：DISCORD_TOKEN")
         return False
     return True
 
 
 def main() -> int:
     print("#" * 60)
-    print("   Openworld VPS 自动续期 (v24-github)")
+    print("   Openworld VPS 自动续期 (v25-github)")
     print("#" * 60)
 
     if not check_config():
