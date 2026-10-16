@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+# v26-github: rotate inverse 模式 + token 通过即停 + odd 两两 NCC
 
 import os
 import re
@@ -35,9 +35,6 @@ CONFIG = {
     "SCREENSHOT_DIR": "./screenshots",
     "RENEW_THRESHOLD_DAYS": 5,
     "MATCH_STRATEGY": os.environ.get("MATCH_STRATEGY", "same").strip().lower(),
-    # ★ 新增：rotate 方向
-    #   direct  → value = best_angle（假设服务端期望"chip 已转的角度"）
-    #   inverse → value = (360 - best_angle) % 360（假设服务端期望"要转回去的角度"）
     "ROTATE_MODE": os.environ.get("ROTATE_MODE", "direct").strip().lower(),
 }
 
@@ -665,7 +662,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
         print(f"   ⚠️ NCC {best_score:.3f} 低于提交阈值 {ROTATE_NCC_SUBMIT}，放弃提交")
         return -1
 
-    # ★★★ v25: 根据 ROTATE_MODE 决定返回值
     if ROTATE_MODE == "inverse":
         value = (360 - best_angle) % 360
     else:
@@ -675,6 +671,7 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
 
 
 def _solve_odd(bg_bytes, meta):
+    """★ v26: 形状分支改用"两两 NCC 平均"算法"""
     bg = _decode(bg_bytes)
     if bg is None:
         raise RuntimeError("解码失败")
@@ -700,7 +697,6 @@ def _solve_odd(bg_bytes, meta):
 
     ci = int(np.argmax(dists))
     mean_d = float(np.mean(dists))
-    # ★★★ v25: 回退到 1.5 倍阈值 —— 修复之前 2.0 倍导致异类 dist == threshold 的 bug
     color_threshold = max(mean_d * 1.5, 180.0)
     if dists[ci] > color_threshold:
         print(f"   🎨 odd 颜色异类: item#{ci} {items[ci]} "
@@ -714,20 +710,35 @@ def _solve_odd(bg_bytes, meta):
         sub = gray[max(0, y - r):y + r, max(0, x - r):x + r]
         patches.append(sub.astype(np.float32))
 
-    scores = []
+    # ★ v26: 两两 NCC 平均
+    h = min(p.shape[0] for p in patches)
+    w = min(p.shape[1] for p in patches)
+    rp = [cv2.resize(p, (w, h)) for p in patches]
+
+    def _ncc_pair(a, b):
+        av = a - a.mean()
+        bv = b - b.mean()
+        d = float(np.sqrt((av * av).sum()) * np.sqrt((bv * bv).sum()))
+        return float((av * bv).sum() / d) if d > 1e-6 else 0.0
+
+    ncc_mat = [[_ncc_pair(rp[i], rp[j]) for j in range(n)] for i in range(n)]
+    avg_ncc = []
     for i in range(n):
-        others = [p for j, p in enumerate(patches) if j != i]
-        h = min(p.shape[0] for p in others)
-        w = min(p.shape[1] for p in others)
-        tmpl = np.mean([cv2.resize(p, (w, h)) for p in others], axis=0)
-        p = cv2.resize(patches[i], (w, h))
-        av = tmpl - tmpl.mean()
-        bv = p - p.mean()
-        d = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
-        scores.append(float((av * bv).sum() / d) if d > 1e-6 else 0.0)
-    si = int(np.argmin(scores))
-    print(f"   🎨 odd 形状异类: item#{si} {items[si]} ncc={scores[si]:.3f} "
-          f"(颜色未过阈: {dists[ci]:.1f} vs thr {color_threshold:.1f})")
+        others_ncc = [ncc_mat[i][j] for j in range(n) if j != i]
+        avg_ncc.append(sum(others_ncc) / len(others_ncc))
+
+    si = int(np.argmin(avg_ncc))
+
+    # 检查其它三个是否彼此相似
+    others_idx = [j for j in range(n) if j != si]
+    pairwise_ok = all(
+        ncc_mat[a][b] > 0.6
+        for a in others_idx for b in others_idx if a != b
+    )
+
+    print(f"   🎨 odd 形状异类: item#{si} {items[si]} avg_ncc={avg_ncc[si]:.3f} "
+          f"其它三个 pairwise_ok={pairwise_ok}")
+    print(f"      avg_ncc={[f'{x:.3f}' for x in avg_ncc]}")
     return si
 
 
@@ -760,7 +771,7 @@ def _match_map_calc(bg_bytes, meta, strategy=None):
     def _ncc(a, b):
         av = a - a.mean()
         bv = b - b.mean()
-        d = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
+        d = float(np.sqrt((av * av).sum()) * np.sqrt((bv * bv).sum()))
         return float((av * bv).sum() / d) if d > 1e-6 else 0.0
 
     mat = [[_ncc(lp[i], rp[j]) for j in range(3)] for i in range(3)]
@@ -862,7 +873,6 @@ def _click_captcha_point(page, x, y):
 
 
 def _click_match_pairs(page, meta, match_map):
-    """★ v25: 强化行为 —— 瞄-犹豫-回-再点、长停顿、二次轻点。"""
     left = meta.get("left") or []
     right = meta.get("right") or []
     if len(left) != 3 or len(right) != 3:
@@ -875,12 +885,10 @@ def _click_match_pairs(page, meta, match_map):
         return px + random.gauss(0, 5), py + random.gauss(0, 5)
 
     def _human_click(px, py):
-        # ★ 先 hover 到目标附近（偏移 ±15px），停一下，再移到目标
         near_x = px + random.uniform(-15, 15)
         near_y = py + random.uniform(-15, 15)
         _hover_to(page, near_x, near_y)
         page.wait_for_timeout(random.randint(120, 280))
-        # 再精确移到目标
         _hover_to(page, px, py)
         page.wait_for_timeout(random.randint(80, 200))
 
@@ -892,7 +900,6 @@ def _click_match_pairs(page, meta, match_map):
         page.mouse.down()
         page.wait_for_timeout(hold)
         page.mouse.up()
-        # 偶发二次轻点
         if random.random() < 0.20:
             page.wait_for_timeout(random.randint(80, 200))
             page.mouse.down()
@@ -900,30 +907,25 @@ def _click_match_pairs(page, meta, match_map):
             page.mouse.up()
 
     for i in range(3):
-        # ★ 每次点击前，先在图上随机晃一下
         hx = bb["x"] + bb["width"] * random.uniform(0.15, 0.85)
         hy = bb["y"] + bb["height"] * random.uniform(0.15, 0.85)
         _hover_to(page, hx, hy)
         page.wait_for_timeout(random.randint(180, 420))
 
-        # 左卡
         lx, ly = _box_pos_to_page(page, left[i]["x"], left[i]["y"])
         lx, ly = _jitter(lx, ly)
         _human_click(lx, ly)
 
-        # ★ 左→右之间长停顿（模拟看图思考）
         if i == 1:
             page.wait_for_timeout(random.randint(1400, 2200))
         else:
             page.wait_for_timeout(random.randint(600, 1200))
 
-        # 右卡
         rj = right[match_map[i]]
         rx, ry = _box_pos_to_page(page, rj["x"], rj["y"])
         rx, ry = _jitter(rx, ry)
         _human_click(rx, ry)
 
-        # 每对之间停顿
         page.wait_for_timeout(random.randint(700, 1500))
 
     page.wait_for_timeout(random.randint(600, 1100))
@@ -1043,7 +1045,6 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
         try:
             value = _solve_rotate(frames[0], frames[1], meta, tag=tag)
             if value < 0:
-                # ★★★ v25: 回退到 v23 行为 —— rotate 失败切 alt（保留会话）
                 print(f"   ⚠️ rotate 求解失败（NCC 过低），尝试切换 {alt}")
                 if alt in SUPPORTED_KINDS:
                     try:
@@ -1210,9 +1211,10 @@ def _try_renew_session(page, attempt, initial_days):
                 print(f"   ✅ 续期成功！{initial_days} → {new_days} 天")
                 return True
 
-            print(f"   ❌ 已拿到 token，Confirm={confirm_ok}，但多次刷新后"
-                  f"仍未检测到天数增加，判定失败")
-            return None
+            # ★★★ v26: token 已通过但天数未变 → 视为"已提交，待确认"
+            print(f"   ⚠️ token 已通过且 Confirm 成功，但天数未变（服务端延迟或配额限制）")
+            print(f"   ℹ️ 停止重试，视为已提交")
+            return "submitted"
 
         if resp in ("burned", "blocked", "rate"):
             print(f"   ❌ 服务端拒绝: {resp}")
@@ -1276,7 +1278,7 @@ def _try_renew_session(page, attempt, initial_days):
 
 
 def try_renew_captcha(page, initial_days, max_attempts=12):
-    """★ v25: 12 次重试 + 短冷却（1.5–3s）。"""
+    """★ v26: 处理 "submitted" 特殊返回值"""
     for attempt in range(1, max_attempts + 1):
         _reset_align_pick()
         try:
@@ -1289,6 +1291,11 @@ def try_renew_captcha(page, initial_days, max_attempts=12):
 
         if r is True:
             return True
+
+        # ★★★ v26: token 通过但天数未变，停止重试
+        if r == "submitted":
+            print(f"   ℹ️ 第 {attempt} 次会话已提交续期请求，停止重试")
+            return "submitted"
 
         if attempt < max_attempts:
             _reset_ws_state()
@@ -1365,7 +1372,7 @@ def check_config():
 
 def main() -> int:
     print("#" * 60)
-    print("   Openworld VPS 自动续期 (v25-github)")
+    print("   Openworld VPS 自动续期 (v26-github)")
     print("#" * 60)
 
     if not check_config():
@@ -1454,13 +1461,19 @@ def main() -> int:
                 print(f"\n{'=' * 50}\n🔄 验证码续期\n{'=' * 50}")
                 ok = try_renew_captcha(page, initial_days=days)
 
-                if ok:
+                if ok is True:
                     expiry = datetime.now(timezone(timedelta(hours=8))) + \
                              timedelta(days=6)
                     es = expiry.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
                     print(f"✅ 续期成功，至: {es}")
                     send_telegram_message(
                         f"✅ 续期成功！\n实例: {url}\n续期至: {es}")
+                elif ok == "submitted":
+                    print(f"⚠️ 续期请求已提交，等待服务端处理")
+                    send_telegram_message(
+                        f"⚠️ 续期请求已提交\n实例: {url}\n"
+                        f"服务端未立即更新天数，可能需要延迟生效")
+                    # submitted 不视为失败
                 else:
                     print("❌ 续期失败")
                     failures += 1
