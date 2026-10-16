@@ -45,7 +45,6 @@ jobs:
 
       # ============================================================
       # 代理（NODE_LINK 私密 Secret，vless）
-      # 只在 use_proxy=true（或定时触发）且 NODE_LINK 存在时启用
       # ============================================================
       - name: Configure sing-box proxy
         if: >-
@@ -209,7 +208,6 @@ jobs:
           if ss -tuln | grep -q ':1080'; then
             echo "✅ SOCKS5 代理已启动 (127.0.0.1:1080)"
             echo "✅ HTTP  代理已启动 (127.0.0.1:1081)"
-            # 检测出口 IP，确认流量真的走了代理（对比直连与代理两个出口）
             DIRECT_IP="$(curl -s --max-time 8 https://api.ipify.org || echo 'unknown')"
             PROXY_IP="$(curl -s --max-time 15 -x http://127.0.0.1:1081 https://api.ipify.org || echo 'unknown')"
             echo "📡 直连出口 IP: $DIRECT_IP"
@@ -227,7 +225,7 @@ jobs:
           fi
 
       # ============================================================
-      # ★★★ 修复：Playwright 缓存 + 强制安装 Chromium
+      # Playwright 缓存 + 强制安装 Chromium
       # ============================================================
 
       - name: 获取 Playwright 版本
@@ -242,16 +240,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          # ★ 用 Playwright 版本做 key：升级后自动失效
           key: playwright-${{ steps.pw-version.outputs.version }}-${{ runner.os }}
           restore-keys: |
             playwright-
 
-      # ★★★ 无条件执行：playwright install 是幂等的
-      #     - 已存在 → 秒过
-      #     - 缺文件 → 只补缺失部分
-      #     - 版本新 → 下载新的
-      #     - 系统依赖 → apt-get 有就跳过
       - name: 安装 Chromium（含系统依赖）
         run: playwright install --with-deps chromium
 
@@ -264,19 +256,17 @@ jobs:
           TG_BOT_TOKEN:  ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
           ACCOUNT_NAME:  ${{ secrets.ACCOUNT_NAME }}
-          # 代理启用时：
-          #   - Chromium 走本地 sing-box SOCKS5（Playwright 内部处理）
-          #   - requests (Discord OAuth / Telegram) 走 sing-box HTTP 端口 1081
           CHROME_PROXY: socks5://127.0.0.1:1080
           HTTP_PROXY:  http://127.0.0.1:1081
           HTTPS_PROXY: http://127.0.0.1:1081
           NO_PROXY: 127.0.0.1,localhost
+          # ★★★ 新增：rotate 方向反转（日志显示 8/8 rotate 全挂）
+          ROTATE_MODE: inverse
         run: |
           if [ "$USE_PROXY" = "true" ]; then
             echo "代理已启用：Chromium 走 ${CHROME_PROXY}，requests 走 ${HTTP_PROXY}"
           else
             echo "直连模式（未使用代理）"
-            # 直连时清掉代理变量，避免脚本误读
             unset CHROME_PROXY HTTP_PROXY HTTPS_PROXY
           fi
           python apprenew.py
